@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pydantic
+numpy
+misaki[en]>=0.9.4
+onnxruntime
+soundfile
+lameenc
+kittentts @ https://github.com/KittenML/KittenTTS/releases/download/0.8/kittentts-0.8.0-py3-none-any.whl

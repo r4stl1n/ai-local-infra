@@ -1,0 +1,204 @@
+name: ai-infra
+services:
+  # ── API GATEWAY (OpenAI-compatible, authenticated front door) ───────────────
+  api:
+    build:
+      context: ./services/api
+    container_name: ai-infra-api
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${INFRA_BIND_IP:-0.0.0.0}:8000:8000"
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+      - LLM_PROVIDER=${LLM_PROVIDER:-local}
+      - LLM_THINKING=${LLM_THINKING:-false}
+      - LLM_NUM_CTX=${LLM_NUM_CTX:-65536}
+      - LLM_URL=${LLM_URL:-}
+      - LLM_API_TOKEN=${LLM_API_TOKEN:-}
+      - TTS_URL=http://kittentts:8100
+      - WHISPER_URL=http://whisper:8200
+      - IMAGEGEN_URL=http://imagegen:8300
+      - DEMUCS_URL=http://demucs:8400
+      - API_KEY=${API_KEY:-}
+      - BACKEND_UPSTREAM_TIMEOUT_SECONDS=${BACKEND_UPSTREAM_TIMEOUT_SECONDS:-900}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ── LLM ─────────────────────────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai-infra-ollama
+    restart: unless-stopped
+    volumes:
+      - ./.data/ollama:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=-1
+      - OLLAMA_NUM_PARALLEL=2
+      - OLLAMA_MAX_LOADED_MODELS=4
+      - OLLAMA_MAX_QUEUE=32
+      # Halve KV-cache VRAM: quantized cache requires flash attention.
+      - OLLAMA_FLASH_ATTENTION=1
+      - OLLAMA_KV_CACHE_TYPE=q8_0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: ai-infra-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ./.data/ollama:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_FORCE_PULL=${OLLAMA_FORCE_PULL:-}
+    # Skip models that already exist locally so startup works offline;
+    # OLLAMA_FORCE_PULL=1 (used by ./infra.sh pull-models) re-pulls to update.
+    entrypoint: >
+      /bin/sh -c "
+        for m in ${OLLAMA_PULL_MODELS:-}; do
+          if [ -z \"$$OLLAMA_FORCE_PULL\" ] && ollama show $$m >/dev/null 2>&1; then
+            echo \"$$m already present, skipping\";
+          else
+            echo \"Pulling $$m...\" &&
+            ollama pull $$m || exit 1;
+          fi;
+        done &&
+        echo 'Models ready'
+      "
+    restart: "no"
+
+  # ── STT ─────────────────────────────────────────────────────────────────────
+  whisper:
+    profiles: ["stt"]
+    build:
+      context: ./services/whisper
+    container_name: ai-infra-whisper
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3-turbo}
+      - WHISPER_CACHE=/data/whisper
+      - WHISPER_PARTIAL_MS=${WHISPER_PARTIAL_MS:-600}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./.data/whisper:/data/whisper
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+  # ── TTS ─────────────────────────────────────────────────────────────────────
+  kittentts:
+    profiles: ["tts"]
+    build:
+      context: ./services/kittentts
+    container_name: ai-infra-kittentts
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      - TTS_MODEL=${TTS_MODEL:-KittenML/kitten-tts-nano-0.8}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_HOME=/data/huggingface
+    volumes:
+      - ./.data/kittentts:/data/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+
+  # ── IMAGE GENERATION ────────────────────────────────────────────────────────
+  imagegen:
+    profiles: ["imagegen"]
+    build:
+      context: ./services/imagegen
+    container_name: ai-infra-imagegen
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      - IMAGEGEN_MODEL=${IMAGEGEN_MODEL:-RunDiffusion/Juggernaut-XL-v9}
+      - IMAGEGEN_STEPS=${IMAGEGEN_STEPS:-30}
+      - IMAGEGEN_GUIDANCE=${IMAGEGEN_GUIDANCE:-5.0}
+      # Never reach the network for weights: cached models load, missing ones error
+      # fast instead of hanging on an unreachable HuggingFace.
+      - IMAGEGEN_OFFLINE=${IMAGEGEN_OFFLINE:-0}
+      - HF_HUB_OFFLINE=${IMAGEGEN_OFFLINE:-0}
+      - TRANSFORMERS_OFFLINE=${IMAGEGEN_OFFLINE:-0}
+      - HF_HOME=/data/imagegen
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./.data/imagegen:/data/imagegen
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8300/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 300s
+
+  # ── SOURCE SEPARATION (Demucs) ──────────────────────────────────────────────
+  demucs:
+    profiles: ["separation"]
+    build:
+      context: ./services/demucs
+    container_name: ai-infra-demucs
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    restart: unless-stopped
+    environment:
+      - DEMUCS_MODEL=${DEMUCS_MODEL:-htdemucs}
+      - DEMUCS_SEGMENT=${DEMUCS_SEGMENT:-}
+      - TORCH_HOME=/data/demucs
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./.data/demucs:/data/demucs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8400/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 180s

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pillow
+torch
+diffusers
+transformers
+accelerate
+safetensors
+# <3: v3 drops the multi tokenizer/text_encoder constructor this service uses.
+compel<3
