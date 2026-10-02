@@ -4,6 +4,8 @@ uvicorn
 python-multipart
 pillow
 torch
+# Qwen3-VL's processor (reference images) imports it.
+torchvision
 # Krea 2 support landed in 0.40.
 diffusers>=0.40
 # Qwen3-VL text encoder.
