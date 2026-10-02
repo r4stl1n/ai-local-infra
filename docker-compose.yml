@@ -148,15 +148,25 @@ services:
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     restart: unless-stopped
     environment:
-      - IMAGEGEN_MODEL=${IMAGEGEN_MODEL:-RunDiffusion/Juggernaut-XL-v9}
-      - IMAGEGEN_STEPS=${IMAGEGEN_STEPS:-30}
-      - IMAGEGEN_GUIDANCE=${IMAGEGEN_GUIDANCE:-5.0}
+      - IMAGEGEN_MODEL=${IMAGEGEN_MODEL:-krea2-turbo}
+      - IMAGEGEN_PIPELINE=${IMAGEGEN_PIPELINE:-ostris/Krea2OstrisEdit}
+      # Empty = the checkpoint's own defaults (Turbo 8 / 0.0, Raw 28 / 4.5).
+      - IMAGEGEN_STEPS=${IMAGEGEN_STEPS:-}
+      - IMAGEGEN_GUIDANCE=${IMAGEGEN_GUIDANCE:-}
+      - IMAGEGEN_STYLE_LORA=${IMAGEGEN_STYLE_LORA-ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors}
+      - IMAGEGEN_EDIT_LORA=${IMAGEGEN_EDIT_LORA:-}
+      # ComfyUI's pre-scaled fp8 transformer so Krea 2 fits a 24 GB GPU (0 = bf16, needs ~32 GB+).
+      - IMAGEGEN_FP8=${IMAGEGEN_FP8:-1}
       # Never reach the network for weights: cached models load, missing ones error
       # fast instead of hanging on an unreachable HuggingFace.
       - IMAGEGEN_OFFLINE=${IMAGEGEN_OFFLINE:-0}
       - HF_HUB_OFFLINE=${IMAGEGEN_OFFLINE:-0}
       - TRANSFORMERS_OFFLINE=${IMAGEGEN_OFFLINE:-0}
       - HF_HOME=/data/imagegen
+      # Compiled GPU kernels: on the volume (the container user may have no home
+      # dir) so they persist across restarts instead of recompiling.
+      - TRITON_CACHE_DIR=/data/imagegen/triton
+      - TORCHINDUCTOR_CACHE_DIR=/data/imagegen/inductor
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./.data/imagegen:/data/imagegen

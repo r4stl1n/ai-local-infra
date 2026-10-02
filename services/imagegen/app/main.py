@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
+import functools
 import gc
+import importlib.util
 import io
+import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -12,43 +17,48 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any, Literal
 
 import torch
-from diffusers import StableDiffusionXLPipeline
-from huggingface_hub.constants import HF_HUB_CACHE
-from fastapi import FastAPI
+from diffusers import AutoencoderKLQwenImage, DiffusionPipeline, FlowMatchEulerDiscreteScheduler
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from PIL import Image
-from pydantic import BaseModel, Field
+from huggingface_hub import snapshot_download
+from huggingface_hub.constants import HF_HUB_CACHE
+from PIL import Image, ImageOps
+from pydantic import BaseModel, Field, ValidationError
+from starlette.datastructures import UploadFile
+from transformers import AutoTokenizer, Qwen3VLModel
 
-try:
-    from compel import Compel, ReturnedEmbeddingsType
+from app.config import (
+    IMAGEGEN_GUIDANCE,
+    IMAGEGEN_MODEL,
+    IMAGEGEN_OFFLINE,
+    IMAGEGEN_PIPELINE,
+    IMAGEGEN_STEPS,
+    LOG_LEVEL,
+    QWEN_VL,
+    SCHEDULER_CONFIG,
+    TRANSFORMER_REPO,
+    VAE,
+    VAE_SUBFOLDER,
+    VARIANTS,
+    Source,
+    pipeline_source,
+    reference_lora_sources,
+    transformer_source,
+)
+from app.fp8 import load_comfy_transformer
 
-    _COMPEL_IMPORT_ERROR: str | None = None
-except Exception as exc:  # optional dependency; degrade to plain (truncating) encoding
-    Compel = None  # type: ignore[assignment,misc]
-    ReturnedEmbeddingsType = None  # type: ignore[assignment,misc]
-    _COMPEL_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
-
-IMAGEGEN_MODEL = os.getenv("IMAGEGEN_MODEL", "RunDiffusion/Juggernaut-XL-v9")
-# Defaults suit full SDXL checkpoints; turbo/lightning distillates
-# (e.g. stabilityai/sdxl-turbo) want ~4 steps and guidance 0.0.
-IMAGEGEN_STEPS = int(os.getenv("IMAGEGEN_STEPS", "30"))
-IMAGEGEN_GUIDANCE = float(os.getenv("IMAGEGEN_GUIDANCE", "5.0"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-
-
-def _is_truthy(value: str | None) -> bool:
-    return (value or "").strip().lower() in ("1", "true", "yes", "on")
-
-
-# When set, never touch the network: a cached model loads, a missing one errors
-# immediately instead of hanging on an unreachable HuggingFace.
-IMAGEGEN_OFFLINE = _is_truthy(os.getenv("IMAGEGEN_OFFLINE"))
 _ENV_KEYS = (
     "IMAGEGEN_MODEL",
+    "IMAGEGEN_PIPELINE",
     "IMAGEGEN_STEPS",
     "IMAGEGEN_GUIDANCE",
+    "IMAGEGEN_STYLE_LORA",
+    "IMAGEGEN_EDIT_LORA",
+    "IMAGEGEN_FP8",
     "IMAGEGEN_OFFLINE",
     "HF_HOME",
     "HF_HUB_OFFLINE",
@@ -79,9 +89,9 @@ def _log_startup_env(service_name: str, keys: tuple[str, ...]) -> None:
     logger.info("%s startup env: %s", service_name, rendered)
 
 
-def _cached_snapshot(model_name: str) -> str | None:
+def _cached_snapshot(repo: str) -> str | None:
     """Path of the locally cached HF snapshot for a repo, or None if absent."""
-    repo_dir = Path(HF_HUB_CACHE) / ("models--" + model_name.replace("/", "--"))
+    repo_dir = Path(HF_HUB_CACHE) / ("models--" + repo.replace("/", "--"))
     ref = repo_dir / "refs" / "main"
     if not ref.is_file():
         return None
@@ -89,99 +99,119 @@ def _cached_snapshot(model_name: str) -> str | None:
     return str(snapshot) if snapshot.is_dir() else None
 
 
-def _installed_models() -> list[str]:
-    """Repo ids of image models present in the local HF cache (with a snapshot)."""
-    root = Path(HF_HUB_CACHE)
-    if not root.is_dir():
-        return []
-    out: list[str] = []
-    for entry in root.glob("models--*"):
-        repo = entry.name[len("models--"):].replace("--", "/")
-        if _cached_snapshot(repo):
-            out.append(repo)
-    return sorted(out)
+def _missing_files(snapshot: Path, source: Source) -> list[str]:
+    missing = [f for f in source.required if not (snapshot / f).is_file()]
+    index = snapshot / "model.safetensors.index.json"
+    if not missing and index.is_file():  # sharded weights: every shard must be there too
+        shards = set(json.loads(index.read_text())["weight_map"].values())
+        missing += [shard for shard in sorted(shards) if not (snapshot / shard).is_file()]
+    return missing
 
 
-def _load_pipeline_attempt(name_or_path: str, local_files_only: bool) -> StableDiffusionXLPipeline:
-    try:
-        return StableDiffusionXLPipeline.from_pretrained(
-            name_or_path,
-            torch_dtype=torch.float16,
-            variant="fp16",
-            local_files_only=local_files_only,
-        )
-    except (ValueError, OSError):
-        # Not every checkpoint publishes fp16 variant files.
-        logger.info("No fp16 variant for %s; loading default weights", name_or_path)
-        return StableDiffusionXLPipeline.from_pretrained(
-            name_or_path,
-            torch_dtype=torch.float16,
-            local_files_only=local_files_only,
-        )
+def _snapshot(source: Source) -> Path:
+    """Local snapshot directory holding `source`.
 
-
-def _load_pipeline(model_name: str) -> StableDiffusionXLPipeline:
-    logger.info("Loading image generation pipeline: %s", model_name)
-    # A model that's present locally is ALWAYS loaded with the network disabled, so
-    # a stray HEAD/etag check can never stall startup — and we never silently fall
-    # back to a (hang-prone) download. Only a genuinely-missing model reaches out,
-    # and only when offline mode isn't forced.
-    cached = _cached_snapshot(model_name)
-    if cached is not None:
-        logger.info("Found in local cache; loading offline from %s", cached)
-        pipe = _load_pipeline_attempt(cached, local_files_only=True)
-    elif IMAGEGEN_OFFLINE:
-        # Our resolver missed it but offline is forced — let HF's own cache lookup
-        # try (network off): it either loads or raises at once, never hangs.
-        logger.info("Not resolved locally; trying HF offline cache for %s", model_name)
-        pipe = _load_pipeline_attempt(model_name, local_files_only=True)
-    else:
-        logger.info("Not cached; downloading from HuggingFace: %s", model_name)
-        pipe = _load_pipeline_attempt(model_name, local_files_only=False)
-    pipe.enable_model_cpu_offload()
-    pipe.enable_attention_slicing()
-    pipe.vae.enable_slicing()
-    logger.info("Image generation pipeline loaded (model CPU offload + attention slicing)")
-    return pipe
-
-
-def _build_compel(pipe: StableDiffusionXLPipeline):
-    """Build a Compel encoder for SDXL that accepts prompts longer than 77 tokens.
-
-    `truncate_long_prompts=False` makes Compel split a long prompt into 75-token
-    chunks and concatenate their CLIP embeddings (the "segment combination" the
-    bare pipeline lacks), instead of hard-truncating at 77. Returns None if Compel
-    is unavailable, so the service still runs with plain (truncating) encoding.
+    A complete cached copy is ALWAYS used with the network untouched, so a stray
+    HEAD/etag check can never stall startup. Only missing files are downloaded,
+    and never when offline mode is forced (that errors at once instead of hanging).
     """
-    if Compel is None:
-        logger.warning(
-            "compel unavailable (%s); prompts over 77 tokens will be truncated",
-            _COMPEL_IMPORT_ERROR,
+    cached = _cached_snapshot(source.repo)
+    missing = _missing_files(Path(cached), source) if cached else list(source.required)
+    if cached and not missing:
+        return Path(cached)
+    if IMAGEGEN_OFFLINE:
+        raise FileNotFoundError(
+            f"{source.repo} is missing {missing or 'its files'} locally and IMAGEGEN_OFFLINE is set "
+            "(fetch with ./infra.sh pull-models)"
         )
-        return None
+    logger.info("Downloading %s %s", source.repo, list(source.patterns))
+    return Path(snapshot_download(source.repo, allow_patterns=list(source.patterns)))
+
+
+def _is_installed(model_name: str) -> bool:
+    """Whether a variant's transformer file is already in the local cache."""
+    cached = _cached_snapshot(TRANSFORMER_REPO)
+    return bool(cached) and not _missing_files(Path(cached), transformer_source(model_name))
+
+
+@functools.cache
+def _community_classes():
+    """(pipeline class, transformer class) from the community pipeline.py, imported
+    straight from the local snapshot."""
+    path = _snapshot(pipeline_source()) / "pipeline.py"
+    spec = importlib.util.spec_from_file_location("krea2_community_pipeline", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.Krea2OstrisEditPipeline, module.Krea2Transformer2DModel
+
+
+def _load_reference_loras(pipe: DiffusionPipeline) -> frozenset[str]:
+    """Load each configured reference-mode LoRA as a disabled adapter named after
+    its mode; requests enable one per render. Returns the modes that loaded — a
+    LoRA that fails only disables its own mode."""
+    loaded = set()
+    for mode, source in reference_lora_sources().items():
+        try:
+            weight = source.required[0] if source.required else None
+            pipe.load_lora_weights(str(_snapshot(source)), weight_name=weight, adapter_name=mode)
+        except Exception as exc:
+            logger.warning("%s LoRA %s unavailable (%s: %s); reference_mode=%s disabled",
+                           mode, source.repo, type(exc).__name__, exc, mode)
+            continue
+        loaded.add(mode)
+        logger.info("%s LoRA loaded: %s", mode, source.repo)
+    if loaded:
+        pipe.transformer.disable_adapters()
+        # PEFT creates adapters in fp32; the LoRAs ship in bf16, so this is lossless.
+        for name, param in pipe.transformer.named_parameters():
+            if "lora_" in name:
+                param.data = param.data.to(torch.bfloat16)
+    return frozenset(loaded)
+
+
+def _prepare_reference_processor(pipe: DiffusionPipeline) -> None:
+    """Build the pipeline's lazily-loaded Qwen3-VL processor now, so a broken
+    processor shows up at startup instead of on the first reference request."""
     try:
-        # With enable_model_cpu_offload() the text encoders report device=cpu while
-        # offloaded, so Compel would build its token-index tensors on CPU while the
-        # accelerate hook runs the weights on cuda -> "tensors on different devices".
-        # Pin Compel to the GPU so index and weights meet on the same device.
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compel = Compel(
-            tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
-            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
-            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
-            requires_pooled=[False, True],
-            truncate_long_prompts=False,
-            device=device,
-        )
-        logger.info("Compel long-prompt encoder ready on %s (77-token limit lifted)", device)
-        return compel
+        pipe.vl_processor
     except Exception as exc:
         logger.warning(
-            "Failed to initialise compel (%s: %s); prompts over 77 tokens will be truncated",
-            type(exc).__name__,
-            exc,
+            "Reference-image processor unavailable (%s: %s); /v1/images/edits will fail",
+            type(exc).__name__, exc,
         )
-        return None
+
+
+def _load_pipeline(model_name: str) -> tuple[DiffusionPipeline, frozenset[str]]:
+    """Assemble Krea 2 `model_name` from its ungated sources.
+    Returns (pipeline, reference modes whose LoRA loaded)."""
+    if model_name not in VARIANTS:
+        raise ValueError(f"unknown image model {model_name!r}; expected one of {sorted(VARIANTS)}")
+    logger.info("Loading image generation pipeline: %s (pipeline %s)", model_name, IMAGEGEN_PIPELINE)
+    pipeline_cls, transformer_cls = _community_classes()
+    transformer = transformer_source(model_name)
+    transformer_path = _snapshot(transformer) / transformer.required[0]
+    logger.info("Loading transformer from %s", transformer_path)
+    qwen = str(_snapshot(QWEN_VL))
+    pipe = pipeline_cls(
+        scheduler=FlowMatchEulerDiscreteScheduler(**SCHEDULER_CONFIG),
+        vae=AutoencoderKLQwenImage.from_pretrained(
+            str(_snapshot(VAE)), subfolder=VAE_SUBFOLDER, torch_dtype=torch.bfloat16
+        ),
+        text_encoder=Qwen3VLModel.from_pretrained(qwen, dtype=torch.bfloat16),
+        tokenizer=AutoTokenizer.from_pretrained(qwen),
+        transformer=load_comfy_transformer(transformer_cls, str(transformer_path)),
+        is_distilled=VARIANTS[model_name].is_distilled,
+    )
+    # The reference-image processor comes from the same (local) Qwen3-VL snapshot.
+    pipe.vl_processor_id = qwen
+    reference_modes = _load_reference_loras(pipe)
+    _prepare_reference_processor(pipe)
+    # Transformer (~13 GB in fp8) and text encoder (~9 GB) don't fit together on
+    # a 24 GB GPU: offload keeps only the active component there.
+    pipe.enable_model_cpu_offload()
+    logger.info("Image generation pipeline loaded (model CPU offload)")
+    return pipe, reference_modes
 
 
 def _free_pipeline(pipe) -> None:
@@ -196,12 +226,7 @@ def _free_pipeline(pipe) -> None:
     if pipe is None:
         return
     try:
-        from accelerate.hooks import remove_hook_from_module
-
-        for name in ("unet", "vae", "text_encoder", "text_encoder_2", "image_encoder"):
-            component = getattr(pipe, name, None)
-            if component is not None:
-                remove_hook_from_module(component, recurse=True)
+        pipe.remove_all_hooks()
         pipe.to("cpu")
     except Exception as exc:  # best-effort — never let cleanup crash a swap
         logger.warning("VRAM cleanup hit %s: %s", type(exc).__name__, exc)
@@ -211,27 +236,28 @@ def _free_pipeline(pipe) -> None:
         torch.cuda.empty_cache()
 
 
+def _install(app: FastAPI, model_name: str | None, pipe, reference_modes: frozenset[str]) -> None:
+    app.state.pipeline = pipe
+    app.state.reference_modes = reference_modes
+    app.state.model_name = model_name
+
+
 def _swap_pipeline(app: FastAPI, model_name: str) -> None:
     """Unload the current model and load `model_name` in its place. Holds the lock
     so it can never race an in-flight generation."""
     with app.state.lock:
         old = app.state.pipeline
-        app.state.pipeline = None
-        app.state.compel = None
+        _install(app, None, None, frozenset())
         _free_pipeline(old)
-        pipe = _load_pipeline(model_name)
-        app.state.compel = _build_compel(pipe)
-        app.state.pipeline = pipe
-        app.state.model_name = model_name
+        pipe, reference_modes = _load_pipeline(model_name)
+        _install(app, model_name, pipe, reference_modes)
 
 
 def _unload_pipeline(app: FastAPI) -> None:
     """Unload the current model and free its VRAM, leaving nothing loaded."""
     with app.state.lock:
         old = app.state.pipeline
-        app.state.pipeline = None
-        app.state.compel = None
-        app.state.model_name = None
+        _install(app, None, None, frozenset())
         _free_pipeline(old)
 
 
@@ -240,29 +266,73 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _log_startup_env("imagegen", _ENV_KEYS)
     # Serializes generation against model swaps (both run in worker threads).
     app.state.lock = threading.Lock()
-    app.state.model_name = IMAGEGEN_MODEL
-    app.state.pipeline = _load_pipeline(IMAGEGEN_MODEL)
-    app.state.compel = _build_compel(app.state.pipeline)
+    pipe, reference_modes = _load_pipeline(IMAGEGEN_MODEL)
+    _install(app, IMAGEGEN_MODEL, pipe, reference_modes)
     yield
 
 
-app = FastAPI(title="Image Generation", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Image Generation", version="0.2.0", lifespan=lifespan)
 
 
-MAX_IMAGE_DIMENSION = 1024
-MIN_IMAGE_DIMENSION = 64
+def _error(status: int, message: str, err_type: str = "invalid_request_error",
+           param: str | None = None) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"message": message, "type": err_type, "param": param, "code": None}},
+    )
 
 
-def _parse_size(size: str) -> tuple[int, int]:
-    """Parse a 'WxH' size string, clamped to MIN..MAX_IMAGE_DIMENSION."""
+def _validation_message(exc: ValidationError | RequestValidationError) -> tuple[str, str | None]:
+    first = exc.errors()[0] if exc.errors() else {}
+    loc = ".".join(str(part) for part in first.get("loc", ()) if part != "body")
+    message = first.get("msg", "invalid request")
+    return (f"Invalid request: {loc}: {message}" if loc else f"Invalid request: {message}"), (loc or None)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    message, param = _validation_message(exc)
+    return _error(400, message, param=param)
+
+
+MAX_IMAGE_DIMENSION = 1536
+MIN_IMAGE_DIMENSION = 256
+# Krea 2 latents are packed 8x (VAE) * 2x (patch): sizes must be multiples of 16.
+SIZE_MULTIPLE = 16
+DEFAULT_SIZE = (1024, 1024)
+# The pipeline was trained with 1-2 reference images.
+MAX_REFERENCE_IMAGES = 2
+MAX_REFERENCE_BYTES = 20 * 1024 * 1024
+
+
+def _clamp_dimension(value: float) -> int:
+    snapped = int(round(value / SIZE_MULTIPLE)) * SIZE_MULTIPLE
+    return max(MIN_IMAGE_DIMENSION, min(snapped, MAX_IMAGE_DIMENSION))
+
+
+def _parse_size(size: str, reference: Image.Image | None = None) -> tuple[int, int]:
+    """Parse a 'WxH' size string, clamped to MIN..MAX_IMAGE_DIMENSION and snapped to
+    multiples of 16. 'auto' (or anything unparseable) gives 1024x1024 — or, with a
+    reference image, the reference's aspect ratio at the same ~1 MP area."""
     try:
         w, h = size.lower().split("x")
-        w, h = int(w), int(h)
+        return _clamp_dimension(int(w)), _clamp_dimension(int(h))
     except (ValueError, AttributeError):
-        return 512, 512
-    w = max(MIN_IMAGE_DIMENSION, min(w, MAX_IMAGE_DIMENSION))
-    h = max(MIN_IMAGE_DIMENSION, min(h, MAX_IMAGE_DIMENSION))
-    return w, h
+        pass
+    if reference is None:
+        return DEFAULT_SIZE
+    rw, rh = reference.size
+    scale = math.sqrt(DEFAULT_SIZE[0] * DEFAULT_SIZE[1] / (rw * rh))
+    return _clamp_dimension(rw * scale), _clamp_dimension(rh * scale)
+
+
+def _set_adapter(pipe: DiffusionPipeline, adapter: str | None) -> None:
+    """Activate one reference-mode LoRA, or none."""
+    if adapter:
+        pipe.transformer.enable_adapters()
+        pipe.set_adapters(adapter)
+    else:
+        pipe.transformer.disable_adapters()
 
 
 def _generate(
@@ -271,89 +341,49 @@ def _generate(
     negative_prompt: str,
     width: int,
     height: int,
+    references: list[Image.Image] | None = None,
+    adapter: str | None = None,
 ) -> Image.Image:
     # Held for the whole render so a model swap can't pull the pipeline out from
     # under us mid-generation.
     with app.state.lock:
         pipe = app.state.pipeline
-        compel = app.state.compel
         if pipe is None:
             raise RuntimeError("no image model is loaded")
-        return _render(pipe, compel, prompt, negative_prompt, width, height)
-
-
-def _pad_to_same_length(a: "torch.Tensor", b: "torch.Tensor") -> tuple["torch.Tensor", "torch.Tensor"]:
-    """Pad two [batch, seq, dim] conditioning tensors to equal sequence length.
-
-    With truncate_long_prompts=False, positive and negative prompts can chunk into
-    different multiples of 77 tokens; SDXL needs both the same length. Pad the
-    shorter one with zeros (benign trailing padding, same as unused CLIP padding).
-    """
-    la, lb = a.shape[1], b.shape[1]
-    if la == lb:
-        return a, b
-    target = max(la, lb)
-
-    def pad(t: "torch.Tensor") -> "torch.Tensor":
-        if t.shape[1] == target:
-            return t
-        filler = torch.zeros(
-            t.shape[0], target - t.shape[1], t.shape[2], device=t.device, dtype=t.dtype
-        )
-        return torch.cat([t, filler], dim=1)
-
-    return pad(a), pad(b)
+        if adapter:
+            _set_adapter(pipe, adapter)
+        try:
+            return _render(pipe, prompt, negative_prompt, width, height, references)
+        finally:
+            if adapter:
+                _set_adapter(pipe, None)
+            # Offload already moved the weights to CPU; hand the allocator's cached
+            # blocks back too, so an idle imagegen leaves the VRAM to Ollama.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 def _render(
-    pipe: StableDiffusionXLPipeline,
-    compel,
+    pipe: DiffusionPipeline,
     prompt: str,
     negative_prompt: str,
     width: int,
     height: int,
+    references: list[Image.Image] | None,
 ) -> Image.Image:
-    base_kwargs = dict(
-        num_inference_steps=IMAGEGEN_STEPS,
-        guidance_scale=IMAGEGEN_GUIDANCE,
-        width=width,
-        height=height,
-    )
+    kwargs: dict[str, Any] = dict(prompt=prompt, width=width, height=height)
+    # Unset steps/guidance fall through to the pipeline's per-checkpoint defaults.
+    if IMAGEGEN_STEPS is not None:
+        kwargs["num_inference_steps"] = IMAGEGEN_STEPS
+    if IMAGEGEN_GUIDANCE is not None:
+        kwargs["guidance_scale"] = IMAGEGEN_GUIDANCE
     negative = (negative_prompt or "").strip()
-
-    # Preferred path: Compel encodes both prompts (chunking anything over 77
-    # tokens) and returns SDXL's dual embeddings + pooled vectors. Positive and
-    # negative may end up different lengths, so pad them to match before use.
-    if compel is not None:
-        try:
-            pos_embeds, pos_pooled = compel(prompt)
-            neg_embeds, neg_pooled = compel(negative)
-            # compel's own pad_conditioning_tensors_to_same_length is broken for the
-            # multi-encoder (SDXL) provider in current versions, so pad here instead.
-            pos_embeds, neg_embeds = _pad_to_same_length(pos_embeds, neg_embeds)
-            result = pipe(
-                prompt_embeds=pos_embeds,
-                pooled_prompt_embeds=pos_pooled,
-                negative_prompt_embeds=neg_embeds,
-                negative_pooled_prompt_embeds=neg_pooled,
-                **base_kwargs,
-            )
-            return result.images[0]
-        except Exception as exc:
-            logger.warning(
-                "Long-prompt encoding failed (%s: %s); falling back to plain encoding",
-                type(exc).__name__,
-                exc,
-            )
-
-    # Fallback: plain diffusers encoding. Supports negative_prompt natively but
-    # truncates either prompt at 77 tokens.
-    result = pipe(
-        prompt=prompt,
-        negative_prompt=negative or None,
-        **base_kwargs,
-    )
-    return result.images[0]
+    if negative:
+        # Only used when guidance is on (Raw); the distilled Turbo runs without CFG.
+        kwargs["negative_prompt"] = negative
+    if references:
+        kwargs["image"] = references
+    return pipe(**kwargs).images[0]
 
 
 def _image_to_b64(image: Image.Image) -> str:
@@ -367,30 +397,134 @@ class ImageRequest(BaseModel):
     negative_prompt: str = ""
     model: str = ""
     n: int = Field(default=1, ge=1, le=4)
-    size: str = "512x512"
+    size: str = "1024x1024"
     response_format: str = "b64_json"
 
 
-@app.post("/v1/images/generations")
-async def create_image(body: ImageRequest) -> JSONResponse:
+class EditRequest(ImageRequest):
+    size: str = "auto"
+    # style: render the prompt in the references' style (style-reference LoRA).
+    # edit: generate with the references as context (subject/edit/composition);
+    # only available when an edit LoRA is configured (IMAGEGEN_EDIT_LORA).
+    reference_mode: Literal["style", "edit"] = "style"
+
+
+class _RequestError(Exception):
+    def __init__(self, message: str, param: str | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.param = param
+
+
+def _json_image_bytes(entry: Any, index: int) -> bytes:
+    """Decode one JSON reference: a data: URI or bare base64 string, or an object
+    {"image_url": ...} / {"image_url": {"url": ...}} / {"b64_json": ...}."""
+    value = entry
+    if isinstance(entry, dict):
+        value = entry.get("image_url") or entry.get("b64_json")
+        if isinstance(value, dict):
+            value = value.get("url")
+    param = f"images.{index}"
+    if not isinstance(value, str) or not value:
+        raise _RequestError(f"{param} must be a data: URI or base64 string", param)
+    if value.startswith(("http://", "https://")):
+        raise _RequestError(f"{param}: remote URLs are not fetched; send a data: URI or base64", param)
+    if value.startswith("data:"):
+        _, sep, value = value.partition(",")
+        if not sep:
+            raise _RequestError(f"{param}: malformed data: URI", param)
+    if len(value) * 3 // 4 > MAX_REFERENCE_BYTES:
+        raise _RequestError(f"{param} exceeds {MAX_REFERENCE_BYTES // (1024 * 1024)} MB", param)
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raise _RequestError(f"{param} is not valid base64", param) from None
+
+
+def _decode_reference(raw: bytes, index: int) -> Image.Image:
+    param = f"image.{index}"
+    if not raw:
+        raise _RequestError(f"{param} is empty", param)
+    if len(raw) > MAX_REFERENCE_BYTES:
+        raise _RequestError(f"{param} exceeds {MAX_REFERENCE_BYTES // (1024 * 1024)} MB", param)
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except (OSError, Image.DecompressionBombError) as exc:
+        raise _RequestError(f"{param} is not a readable image ({exc})", param) from None
+    # Phone photos store rotation in EXIF; apply it so the model sees them upright.
+    return ImageOps.exif_transpose(image).convert("RGB")
+
+
+async def _read_edit_request(request: Request) -> tuple[EditRequest, list[bytes]]:
+    """Accept OpenAI's multipart form (`image` / `image[]` files) or a JSON body
+    with `images` (or `image`) as base64 / data: URIs."""
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data"):
+        form = await request.form()
+        uploads = [*form.getlist("image"), *form.getlist("image[]")]
+        if any(not isinstance(u, UploadFile) for u in uploads):
+            raise _RequestError("image must be uploaded as a file", "image")
+        raw = [await u.read() for u in uploads]
+        has_mask = "mask" in form
+        fields = {
+            k: v for k, v in form.multi_items()
+            if isinstance(v, str) and k not in ("image", "image[]", "mask")
+        }
+    else:
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise _RequestError("body must be JSON or multipart/form-data") from None
+        if not isinstance(payload, dict):
+            raise _RequestError("body must be a JSON object")
+        images = payload.pop("images", None)
+        if images is None:
+            images = payload.pop("image", None)
+        if isinstance(images, (str, dict)):
+            images = [images]
+        if not isinstance(images, list):
+            raise _RequestError("images is required", "images")
+        raw = [_json_image_bytes(entry, i) for i, entry in enumerate(images)]
+        has_mask = payload.pop("mask", None) is not None
+        fields = payload
+
+    if has_mask:
+        raise _RequestError(
+            "mask is not supported: Krea 2 conditions on whole reference images and does not inpaint",
+            "mask",
+        )
+    if not raw:
+        raise _RequestError("at least one reference image is required", "image")
+    if len(raw) > MAX_REFERENCE_IMAGES:
+        raise _RequestError(f"at most {MAX_REFERENCE_IMAGES} reference images are supported", "image")
+    try:
+        body = EditRequest.model_validate(fields)
+    except ValidationError as exc:
+        message, param = _validation_message(exc)
+        raise _RequestError(message, param) from None
+    return body, raw
+
+
+async def _generate_response(
+    body: ImageRequest,
+    width: int,
+    height: int,
+    references: list[Image.Image] | None = None,
+    adapter: str | None = None,
+) -> JSONResponse:
     if app.state.pipeline is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": {"message": "no image model is loaded", "type": "api_error"}},
-        )
-
+        return _error(503, "no image model is loaded", "api_error")
     if not body.prompt.strip():
-        return JSONResponse(
-            status_code=400,
-            content={"error": {"message": "prompt must not be empty", "type": "invalid_request_error"}},
-        )
+        return _error(400, "prompt must not be empty", param="prompt")
 
-    width, height = _parse_size(body.size)
     logger.info(
-        "Generating %d image(s): %dx%d prompt=%r negative=%r",
+        "Generating %d image(s): %dx%d refs=%d%s prompt=%r negative=%r",
         body.n,
         width,
         height,
+        len(references or ()),
+        f" ({adapter})" if adapter else "",
         body.prompt[:120],
         body.negative_prompt[:120],
     )
@@ -398,20 +532,54 @@ async def create_image(body: ImageRequest) -> JSONResponse:
 
     data = []
     for i in range(body.n):
-        image = await asyncio.to_thread(
-            _generate, app, body.prompt, body.negative_prompt, width, height
-        )
-        b64 = _image_to_b64(image)
-        data.append({"b64_json": b64})
+        try:
+            image = await asyncio.to_thread(
+                _generate, app, body.prompt, body.negative_prompt, width, height, references, adapter
+            )
+        except torch.cuda.OutOfMemoryError:
+            logger.exception("GPU out of memory generating a %dx%d image", width, height)
+            return _error(
+                503,
+                f"GPU out of memory generating a {width}x{height} image. Free VRAM (POST /v1/models/unload "
+                "unloads the LLMs) or request a smaller size.",
+                "api_error",
+            )
+        except Exception as exc:
+            logger.exception("Image generation failed")
+            return _error(500, f"image generation failed: {type(exc).__name__}: {exc}", "api_error")
+        data.append({"b64_json": _image_to_b64(image)})
         logger.info("Image %d/%d generated", i + 1, body.n)
 
-    elapsed = time.monotonic() - t0
-    logger.info("Generation complete in %.1fs", elapsed)
+    logger.info("Generation complete in %.1fs", time.monotonic() - t0)
+    return JSONResponse(content={"created": int(time.time()), "data": data})
 
-    return JSONResponse(content={
-        "created": int(time.time()),
-        "data": data,
-    })
+
+@app.post("/v1/images/generations")
+async def create_image(body: ImageRequest) -> JSONResponse:
+    width, height = _parse_size(body.size)
+    return await _generate_response(body, width, height)
+
+
+@app.post("/v1/images/edits")
+async def edit_image(request: Request) -> JSONResponse:
+    """Generate from a prompt plus 1-2 reference images (OpenAI images/edits shape)."""
+    try:
+        body, raw = await _read_edit_request(request)
+        references = [_decode_reference(data, i) for i, data in enumerate(raw)]
+    except _RequestError as exc:
+        return _error(400, exc.message, param=exc.param)
+
+    mode = body.reference_mode
+    if mode not in app.state.reference_modes:
+        env = "IMAGEGEN_EDIT_LORA" if mode == "edit" else "IMAGEGEN_STYLE_LORA"
+        return _error(
+            400,
+            f"reference_mode={mode} is unavailable: its LoRA is not loaded (set {env}); "
+            f"available: {sorted(app.state.reference_modes) or 'none'}",
+            param="reference_mode",
+        )
+    width, height = _parse_size(body.size, references[0])
+    return await _generate_response(body, width, height, references, mode)
 
 
 class LoadModelRequest(BaseModel):
@@ -420,14 +588,16 @@ class LoadModelRequest(BaseModel):
 
 @app.get("/v1/images/models")
 async def list_image_models() -> JSONResponse:
-    """List image models present in the local cache and which one is loaded."""
+    """List the Krea 2 variants, whether each is downloaded, and which is loaded,
+    plus the /v1/images/edits reference modes the loaded model supports."""
     current = app.state.model_name
-    ids = set(_installed_models())
-    if current:
-        ids.add(current)  # the loaded model is available even if the scan missed it
     return JSONResponse(content={
         "current": current,
-        "data": [{"id": m, "loaded": m == current} for m in sorted(ids)],
+        "reference_modes": sorted(app.state.reference_modes),
+        "data": [
+            {"id": m, "loaded": m == current, "downloaded": m == current or _is_installed(m)}
+            for m in sorted(VARIANTS)
+        ],
     })
 
 
@@ -437,27 +607,19 @@ async def load_image_model(body: LoadModelRequest) -> JSONResponse:
     returns once the new model is ready."""
     model = body.model.strip()
     if not model:
-        return JSONResponse(
-            status_code=400,
-            content={"error": {"message": "model is required", "type": "invalid_request_error"}},
-        )
-    if IMAGEGEN_OFFLINE and _cached_snapshot(model) is None:
-        return JSONResponse(
-            status_code=400,
-            content={"error": {
-                "message": f"model {model!r} is not in the local cache and IMAGEGEN_OFFLINE is set",
-                "type": "invalid_request_error",
-            }},
-        )
+        return _error(400, "model is required", param="model")
+    # Checked before the swap, which unloads the current model first.
+    if model not in VARIANTS:
+        return _error(400, f"unknown model {model!r}; expected one of {sorted(VARIANTS)}", param="model")
+    if IMAGEGEN_OFFLINE and not _is_installed(model):
+        return _error(400, f"model {model!r} is not in the local cache and IMAGEGEN_OFFLINE is set",
+                      param="model")
     logger.info("Loading image model: %s", model)
     try:
         await asyncio.to_thread(_swap_pipeline, app, model)
     except Exception as exc:
         logger.exception("Failed to load image model %s", model)
-        return JSONResponse(
-            status_code=502,
-            content={"error": {"message": f"failed to load {model!r}: {exc}", "type": "api_error"}},
-        )
+        return _error(502, f"failed to load {model!r}: {exc}", "api_error")
     return JSONResponse(content={"current": app.state.model_name})
 
 

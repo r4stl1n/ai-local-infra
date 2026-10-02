@@ -24,10 +24,14 @@ client = OpenAI(base_url="http://HOST:8000/v1", api_key="<API_KEY>")
 | GET | `/v1/models` | List available models |
 | POST | `/v1/chat/completions` | Chat (streaming, tools, vision) |
 | POST | `/v1/embeddings` | Text embeddings |
+| POST | `/v1/systemone` | Typed decisions with Jev-style decision models (Ollama ≥ 0.35) |
 | POST | `/v1/audio/speech` | Text-to-speech |
 | POST | `/v1/audio/transcriptions` | Speech-to-text (multipart upload) |
 | WS | `/v1/audio/transcriptions/stream` | Streaming speech-to-text |
 | POST | `/v1/images/generations` | Text-to-image |
+| POST | `/v1/images/edits` | Image generation from 1–2 reference images |
+| GET | `/v1/models/loaded` | LLM/embedding models currently in VRAM |
+| POST | `/v1/models/unload` | Free VRAM held by LLM/embedding models |
 
 ---
 
@@ -123,6 +127,52 @@ list shape; vector dimension depends on the model (768 for
 
 Embeddings always run on the local Ollama regardless of the server's LLM
 provider setting.
+
+---
+
+### POST /v1/systemone
+
+Jev-style **decision models** (Ollama >= 0.35): send a `state` and named, typed
+`questions`, get every answer back in one call with calibrated probabilities —
+for triage, routing, moderation and similar fast typed decisions. Models:
+`nimble` (9B), `tev1` (4B), `tev1:0.8b` (0.8B); the server must have pulled the
+one you name (`OLLAMA_PULL_MODELS`), otherwise `404`.
+
+```json
+{"model": "nimble",
+ "state": {"ticket": "I was charged twice. Please refund the extra payment."},
+ "questions": {
+   "team":    {"type": "choice", "instructions": "Which team should handle this ticket?",
+               "criteria": {"billing": "Payments and refunds", "technical": "Bugs and integrations", "other": "None of the above"}},
+   "refund":  {"type": "noul",   "instructions": "Does the customer explicitly ask for a refund?"},
+   "urgency": {"type": "score",  "instructions": "How urgent is this ticket?", "criteria": ["Routine", "Soon", "Urgent"]}}}
+```
+
+| Question `type` | Extra fields | Answer fields |
+|---|---|---|
+| `choice` | `criteria`: `{"option": "description"}` | `choice` (picked option), `probabilities` per option, `confidence` |
+| `noul` | — | `noul`: probability that the answer is yes (0–1) |
+| `score` | `criteria`: ordered labels, low → high | `score` (expected position on the 0…n-1 scale), `legend`, `probabilities`, `confidence` |
+
+```json
+{"model": "nimble",
+ "answers": {
+   "team":    {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.985, "technical": 0.012, "other": 0.003}, "confidence": 0.922},
+   "refund":  {"type": "noul", "noul": 0.997},
+   "urgency": {"type": "score", "score": 0.815, "legend": {"0": "Routine", "1": "Soon", "2": "Urgent"},
+               "probabilities": {"0": 0.378, "1": 0.429, "2": 0.193}, "confidence": 0.046}},
+ "usage": {"input_tokens": 841, "output_tokens": 4}}
+```
+
+The answers are passed through from Ollama unchanged. The [TypeSafe
+SDK](https://pypi.org/project/typesafe-sdk/) works against the gateway:
+`TYPESAFE_BASE_URL=http://HOST:8000`, `TYPESAFE_API_KEY=<API_KEY>`,
+`TYPESAFE_DEFAULT_MODEL=nimble`, then `client.system_one(state=..., questions=...)`.
+(`client.models.list()` doesn't work: it expects TypeSafe's own model-list
+format, while `/v1/models` is the OpenAI one — use `/v1/models` directly.)
+
+Like embeddings, decision models always run on the local Ollama, and they
+share its VRAM: `/v1/models/loaded` and `/v1/models/unload` cover them.
 
 ---
 
@@ -234,27 +284,67 @@ once the model is warm.
 ### POST /v1/images/generations
 
 ```json
-{"prompt": "a lighthouse at sunset, photo", "negative_prompt": "blurry, watermark", "size": "1024x1024", "n": 1}
+{"prompt": "a lighthouse at sunset, photo", "size": "1024x1024", "n": 1}
 ```
 
 | Field | Default | Notes |
 |---|---|---|
-| `prompt` | required | 400 if empty |
-| `negative_prompt` | `""` | Things to steer away from. Same long-prompt handling as `prompt` |
-| `size` | `"512x512"` | `"WxH"`, each dimension clamped to 64–1024. The default model (Juggernaut-XL, full SDXL) composes best at `1024x1024` |
-| `n` | `1` | 1–4 images (generated sequentially — expect ~10 s each at 1024²) |
+| `prompt` | required | 400 if empty. No 77-token limit — Krea 2 encodes prompts with a Qwen3-VL LLM, so long, descriptive prompts work well |
+| `negative_prompt` | `""` | Only takes effect with CFG (`krea2-raw`); ignored by the default Turbo model |
+| `size` | `"1024x1024"` | `"WxH"`, each dimension clamped to 256–1536 and snapped to a multiple of 16 (so `1536x1024` / `1024x1536` work). `"auto"` = `1024x1024` |
+| `n` | `1` | 1–4 images (generated sequentially) |
 | `model` | ignored | Server uses its configured diffusion model |
 | `response_format` | `b64_json` | Only `b64_json` is supported; there is no `url` mode |
-
-Prompts are **not** capped at CLIP's 77 tokens: the server chunks long
-prompts into 75-token segments and concatenates their embeddings (via
-compel), so both `prompt` and `negative_prompt` can be arbitrarily long.
-Earlier tokens still carry the most weight.
 
 Response: `{"created": <unix>, "data": [{"b64_json": "<base64 PNG>"}]}`.
 Decode `b64_json` to get a PNG file.
 
 If no model is loaded (after `unload`), generation returns `503`.
+
+---
+
+### POST /v1/images/edits
+
+Generates an image from a prompt **plus 1–2 reference images**. It's the
+OpenAI `images/edits` endpoint, so `client.images.edit(...)` works.
+
+Krea 2 is a text-to-image model: it only uses reference images through a LoRA
+trained for it, one per `reference_mode`:
+
+- **`style`** (default, always available): renders the prompt in the
+  references' style — palette, medium, brushwork, lighting — without copying
+  their content. "a yeti reading a book" + an oil painting → an oil-painted yeti.
+- **`edit`**: the references as subject/edit context ("the same dog in a space
+  suit", "make the sky purple"). Only available when the server has an edit
+  LoRA configured (`IMAGEGEN_EDIT_LORA`); otherwise `400`. No general-purpose
+  Krea 2 edit LoRA is published yet.
+
+`GET /v1/images/models` lists the available modes in `reference_modes`.
+
+Multipart (OpenAI SDK / curl):
+
+```bash
+curl http://HOST:8000/v1/images/edits -H "Authorization: Bearer $API_KEY" \
+  -F prompt="a cat sleeping on a windowsill" \
+  -F "image[]=@watercolor.png" -F size=auto
+```
+
+JSON (references as `data:` URIs or bare base64):
+
+```json
+{"prompt": "a white yeti reading a book", "images": [{"image_url": "data:image/png;base64,..."}], "reference_mode": "style"}
+```
+
+| Field | Default | Notes |
+|---|---|---|
+| `image` / `image[]` (multipart) or `images` (JSON) | required | 1–2 reference images (PNG/JPEG/WebP, ≤ 20 MB each). JSON entries may be a string or `{"image_url": ...}` / `{"b64_json": ...}`; remote `http(s)` URLs are not fetched (400) |
+| `prompt` | required | Describe the result or the change you want |
+| `reference_mode` | `"style"` | Extension. `style` or `edit` (see above); a mode whose LoRA isn't loaded is a `400` |
+| `size` | `"auto"` | `auto` matches the first reference's aspect ratio at ~1 MP; otherwise as in `/generations` |
+| `n`, `negative_prompt`, `model`, `response_format` | | As in `/generations` |
+| `mask` | — | Not supported (400): Krea 2 conditions on whole images and does not inpaint |
+
+Response: same shape as `/generations`.
 
 ---
 
@@ -266,14 +356,42 @@ frees its VRAM. Loads are slow (weights + VRAM) and the request blocks until
 the new model is ready.
 
 ```
-GET  /v1/images/models              -> {"current": "<repo>", "data": [{"id": "<repo>", "loaded": bool}, ...]}
-POST /v1/images/models/load  {"model": "<repo>"}   -> {"current": "<repo>"}
+GET  /v1/images/models              -> {"current": "krea2-turbo", "reference_modes": ["style"], "data": [{"id": "krea2-turbo", "loaded": bool, "downloaded": bool}, ...]}
+POST /v1/images/models/load  {"model": "krea2-raw"} -> {"current": "krea2-raw"}
 POST /v1/images/models/unload                      -> {"current": null}
 ```
 
-`data` lists the image checkpoints present in the local cache. With
-`IMAGEGEN_OFFLINE=1`, `load` refuses a model that isn't already cached
-(400) rather than trying to download it.
+`data` lists the Krea 2 variants (`krea2-turbo`, `krea2-raw`) and whether each
+is downloaded; loading one that isn't downloads it first. An unknown id is a
+`400` and leaves the current model loaded. With `IMAGEGEN_OFFLINE=1`, `load`
+refuses a model that isn't already cached (400) rather than downloading it.
+
+---
+
+### Freeing VRAM
+
+The LLM (Ollama) and the image model share the GPU. To make room for one,
+unload the other; both reload paths are explicit and cheap to call.
+
+```
+GET  /v1/models/loaded                       -> {"data": [{"id": "gemma4:12b", "size_vram": <bytes>, "expires_at": "..."}]}
+POST /v1/models/unload  {"model": "<id>"}    -> {"unloaded": ["<id>"]}
+POST /v1/models/unload  (no body)            -> {"unloaded": [<every resident model>]}
+POST /v1/images/models/unload                -> {"current": null}
+POST /v1/images/models/load {"model": "krea2-turbo"} -> {"current": "krea2-turbo"}
+```
+
+- `/v1/models/*` acts on the bundled Ollama, which hosts the chat models
+  (local mode) and the embedding model; with no `model`, everything resident
+  is unloaded. The call returns once the memory is released. An LLM reloads
+  automatically on its next chat/embeddings request (cold-load latency).
+  Unknown model → `404`.
+- The image model does **not** reload by itself: after
+  `/v1/images/models/unload`, image requests return `503` until you call
+  `/v1/images/models/load` (see above).
+
+Typical swap: `POST /v1/models/unload` → `POST /v1/images/models/load` →
+generate → `POST /v1/images/models/unload` → chat resumes (auto-reload).
 
 ---
 
@@ -299,7 +417,7 @@ response means generation actually began.
 ## Operational notes for clients
 
 - **Timeouts**: the gateway allows upstream calls up to 900 s. Set client
-  timeouts generously for image generation (~10 s/image) and long chat
+  timeouts generously for image generation (several seconds per image, more with reference images) and long chat
   completions; first request after a model swap may add cold-load time.
 - **Concurrency**: chat runs up to 2 requests in parallel; more are queued
   server-side (up to 32) rather than rejected. Other endpoints serialize on

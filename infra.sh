@@ -111,15 +111,13 @@ case "${1:-}" in
     ensure_env
     ensure_data_dirs
     OLLAMA_FORCE_PULL=1 compose up --no-deps --exit-code-from ollama-init ollama-init
-    # Pre-fetch the image checkpoint into .data/imagegen so the first (or offline)
+    # Pre-fetch the image checkpoint, its pipeline code, the reference-image
+    # processor and the style LoRA into .data/imagegen so the first (or offline)
     # start doesn't stall on a silent multi-GB download.
     if is_enabled "${ENABLE_IMAGEGEN:-true}"; then
-      img_model="${IMAGEGEN_MODEL:-RunDiffusion/Juggernaut-XL-v9}"
-      echo "Pulling image model: ${img_model}"
       compose run --rm --no-deps \
         -e HF_HUB_OFFLINE=0 -e TRANSFORMERS_OFFLINE=0 -e HF_HOME=/data/imagegen \
-        --entrypoint python3 imagegen \
-        -c "import os; from huggingface_hub import snapshot_download; snapshot_download(os.environ['IMAGEGEN_MODEL'])"
+        --entrypoint python3 imagegen -m app.prefetch
     fi
     ;;
   rebuild)

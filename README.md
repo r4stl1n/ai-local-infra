@@ -9,10 +9,10 @@ Self-hosted model-serving stack for any OpenAI-compatible client. Runs an authen
 | **ollama-init** | One-shot model pull on first start (skips models already present, so startup works offline) | - |
 | **whisper** | Speech-to-text (faster-whisper, GPU) | internal |
 | **kittentts** | Text-to-speech (KittenTTS, CPU) | internal |
-| **imagegen** | Text-to-image (SDXL — Juggernaut-XL by default, GPU) | internal |
+| **imagegen** | Text-to-image and reference-image generation (Krea 2 Turbo, GPU) | internal |
 | **demucs** | Music source separation (vocals/stems, Demucs, GPU; off by default) | internal |
 
-All traffic goes through **api**, which requires `Authorization: Bearer ${API_KEY}` and exposes `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/audio/transcriptions` (plus a `/v1/audio/transcriptions/stream` WebSocket), `/v1/audio/speech`, `/v1/images/generations`, and `/v1/audio/separations` (stem separation, when enabled), plus `/health`. The model services themselves are not published; add port mappings in `docker-compose.yml` if you need direct access.
+All traffic goes through **api**, which requires `Authorization: Bearer ${API_KEY}` and exposes `/v1/chat/completions`, `/v1/embeddings`, `/v1/systemone` (Jev-style decision models), `/v1/models`, `/v1/audio/transcriptions` (plus a `/v1/audio/transcriptions/stream` WebSocket), `/v1/audio/speech`, `/v1/images/generations`, `/v1/images/edits` (generation from 1–2 reference images: style reference, plus edits when an edit LoRA is configured), and `/v1/audio/separations` (stem separation, when enabled), plus `/health`. To share limited VRAM, `/v1/models/loaded` + `/v1/models/unload` (LLM/embeddings) and `/v1/images/models/load|unload` (image model) free one side for the other. The model services themselves are not published; add port mappings in `docker-compose.yml` if you need direct access.
 
 ## OpenAI compatibility
 
@@ -30,6 +30,7 @@ With `LLM_PROVIDER=remote`, chat and `/v1/models` proxy to `LLM_URL`, which may 
 
 - Docker with Compose v2 (`docker compose`)
 - NVIDIA GPU with drivers and [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (ollama, whisper, imagegen)
+- For image generation: a 24 GB GPU, ~23 GB of disk and ~32 GB of system RAM. It uses the same pre-scaled fp8 transformer as ComfyUI ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2), ~13 GB instead of 26 GB in bf16), and CPU offload keeps only one component on the GPU at a time
 
 ## Quick Start
 
@@ -39,6 +40,8 @@ With `LLM_PROVIDER=remote`, chat and `/v1/models` proxy to `LLM_URL`, which may 
 ./infra.sh pull-models  # (re-)pull the models listed in OLLAMA_PULL_MODELS, updating existing ones
 ./infra.sh status
 ```
+
+Image generation needs no HuggingFace account: every weight comes from an ungated repo — the Krea 2 transformer from [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2), the text encoder and VAE from Qwen's own repos (they're the stock Qwen3-VL-4B-Instruct and Qwen-Image VAE). The [Krea 2 Community License](https://huggingface.co/krea/Krea-2-Turbo) still applies to the model.
 
 On first run `infra.sh` creates `.env` with a freshly generated `API_KEY` — read it back with `grep '^API_KEY=' .env` and give it to your clients. If you copy `.env.example` by hand instead, set `API_KEY` yourself (`openssl rand -hex 32`); the gateway refuses to start with an empty key rather than run unauthenticated. Model weights and caches live in `.data/` next to this file.
 
@@ -53,16 +56,22 @@ Once the models are downloaded, the stack starts fully offline: every service lo
 | `LLM_PROVIDER` | `local` | `local` (bundled Ollama) or `remote` (OpenAI-compatible `LLM_URL` + `LLM_API_TOKEN`) |
 | `LLM_THINKING` / `LLM_NUM_CTX` | `false` / `65536` | Default request behavior for local models |
 | `BACKEND_UPSTREAM_TIMEOUT_SECONDS` | `900` | Gateway → upstream timeout budget |
-| `OLLAMA_PULL_MODELS` | `"gemma4:12b snowflake-arctic-embed:137m"` | Space-separated models pulled by `ollama-init` (keep the quotes — the file is `source`d by `infra.sh`) |
+| `OLLAMA_PULL_MODELS` | `"gemma4:12b snowflake-arctic-embed:137m tev1 nimble"` | Space-separated models pulled by `ollama-init` (keep the quotes — the file is `source`d by `infra.sh`). `tev1` and `nimble` are the decision models for `/v1/systemone` |
 | `ENABLE_STT` / `ENABLE_TTS` / `ENABLE_IMAGEGEN` | `true` | Toggle the optional services (compose profiles) |
 | `WHISPER_MODEL` | `large-v3-turbo` | Whisper model size |
 | `TTS_MODEL` | `KittenML/kitten-tts-nano-0.8` | KittenTTS model |
-| `IMAGEGEN_MODEL` | `RunDiffusion/Juggernaut-XL-v9` | Image generation model (any SDXL-family HF checkpoint) |
-| `IMAGEGEN_STEPS` / `IMAGEGEN_GUIDANCE` | `30` / `5.0` | Inference steps and CFG scale, tuned per model — full SDXL checkpoints want ~30 / 5.0; for a faster distillate set `IMAGEGEN_MODEL=stabilityai/sdxl-turbo` with `4` / `0.0` |
+| `IMAGEGEN_MODEL` | `krea2-turbo` | Image model: `krea2-turbo` (8-step distillate) or `krea2-raw` (28 steps, CFG) |
+| `IMAGEGEN_STEPS` / `IMAGEGEN_GUIDANCE` | _(empty)_ | Override inference steps / CFG scale; empty uses the checkpoint's defaults (Turbo `8` / `0.0`, Raw `28` / `4.5`) |
+| `IMAGEGEN_STYLE_LORA` | `ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors` | LoRA (`repo:weight_file`) behind `reference_mode=style` on `/v1/images/edits` (render the prompt in a reference's style); empty disables style mode |
+| `IMAGEGEN_EDIT_LORA` | _(empty)_ | LoRA behind `reference_mode=edit` (subject reference / edits). Off by default: no general Krea 2 edit LoRA is published yet, and without one Krea 2 garbles reference images; train one with [AI Toolkit](https://github.com/ostris/ai-toolkit)'s Krea 2 reference trainer to enable it |
+| `IMAGEGEN_PIPELINE` | `ostris/Krea2OstrisEdit` | Diffusers community pipeline that adds reference-image conditioning to Krea 2 |
+| `IMAGEGEN_FP8` | `1` | Use ComfyUI's pre-scaled fp8 transformer (`Comfy-Org/Krea-2`, ~13 GB, computed in bf16) so Krea 2 fits a 24 GB GPU; `0` = its bf16 transformer (~26 GB, needs a ~32 GB+ GPU) |
 | `IMAGEGEN_OFFLINE` | `0` | `1` = never fetch image weights over the network; cached models load, missing ones error fast instead of hanging. Pre-fetch with `./infra.sh pull-models` |
 
 The active image model can also be listed/swapped/unloaded at runtime via
-`GET/POST /v1/images/models*` — see [integrate.md](integrate.md).
+`GET/POST /v1/images/models*`, and LLM/embedding models freed from VRAM via
+`GET /v1/models/loaded` and `POST /v1/models/unload` — see
+[integrate.md](integrate.md#freeing-vram).
 
 ## Connecting a client
 
@@ -87,6 +96,11 @@ docker run --rm -v $PWD/services/api:/src -w /src -e API_KEY=test \
 # End-to-end audio round-trip against the running stack (stdlib only):
 # TTS generates a sample, Whisper transcribes it back
 python3 -m unittest discover -s tests/e2e -v
+
+# End-to-end Krea 2 check: text-to-image, reference images, style mode and
+# request validation; writes the images to ./imagegen-test-out for a visual check.
+# --vram also cycles the LLM/image unload + reload endpoints.
+tests/e2e/test_imagegen.sh [--vram]
 ```
 
 The e2e tests read `API_KEY` from the environment or `.env`, and target `E2E_API_URL` (default `http://localhost:8000`).

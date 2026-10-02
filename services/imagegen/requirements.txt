@@ -1,10 +1,16 @@
 fastapi
 uvicorn
+# /v1/images/edits accepts OpenAI-style multipart uploads.
+python-multipart
 pillow
 torch
-diffusers
-transformers
+# Qwen3-VL's processor (reference images) imports it.
+torchvision
+# Krea 2 support landed in 0.40.
+diffusers>=0.40
+# Qwen3-VL text encoder.
+transformers>=4.57
 accelerate
 safetensors
-# <3: v3 drops the multi tokenizer/text_encoder constructor this service uses.
-compel<3
+# LoRA adapters (style reference).
+peft
