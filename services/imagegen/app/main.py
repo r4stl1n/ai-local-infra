@@ -3,8 +3,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import functools
 import gc
+import importlib.util
 import io
+import json
 import logging
 import math
 import os
@@ -17,30 +20,36 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
-from diffusers import DiffusionPipeline
+from diffusers import AutoencoderKLQwenImage, DiffusionPipeline, FlowMatchEulerDiscreteScheduler
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 from huggingface_hub.constants import HF_HUB_CACHE
-from huggingface_hub.errors import LocalEntryNotFoundError
 from PIL import Image, ImageOps
 from pydantic import BaseModel, Field, ValidationError
 from starlette.datastructures import UploadFile
+from transformers import AutoTokenizer, Qwen3VLModel
 
 from app.config import (
-    FP8_TRANSFORMER_REPO,
     IMAGEGEN_GUIDANCE,
     IMAGEGEN_MODEL,
     IMAGEGEN_OFFLINE,
     IMAGEGEN_PIPELINE,
     IMAGEGEN_STEPS,
     LOG_LEVEL,
-    VL_PROCESSOR_REPO,
-    fp8_transformer_file,
-    style_lora,
+    QWEN_VL,
+    SCHEDULER_CONFIG,
+    TRANSFORMER_REPO,
+    VAE,
+    VAE_SUBFOLDER,
+    VARIANTS,
+    Source,
+    pipeline_source,
+    style_lora_source,
+    transformer_source,
 )
-from app.fp8 import load_scaled_fp8_transformer
+from app.fp8 import load_comfy_transformer
 
 _ENV_KEYS = (
     "IMAGEGEN_MODEL",
@@ -52,7 +61,6 @@ _ENV_KEYS = (
     "IMAGEGEN_OFFLINE",
     "HF_HOME",
     "HF_HUB_OFFLINE",
-    "HF_TOKEN",
     "LOG_LEVEL",
 )
 _SENSITIVE_ENV_MARKERS = ("PASSWORD", "TOKEN", "KEY", "SECRET")
@@ -81,9 +89,9 @@ def _log_startup_env(service_name: str, keys: tuple[str, ...]) -> None:
     logger.info("%s startup env: %s", service_name, rendered)
 
 
-def _cached_snapshot(model_name: str) -> str | None:
+def _cached_snapshot(repo: str) -> str | None:
     """Path of the locally cached HF snapshot for a repo, or None if absent."""
-    repo_dir = Path(HF_HUB_CACHE) / ("models--" + model_name.replace("/", "--"))
+    repo_dir = Path(HF_HUB_CACHE) / ("models--" + repo.replace("/", "--"))
     ref = repo_dir / "refs" / "main"
     if not ref.is_file():
         return None
@@ -91,35 +99,62 @@ def _cached_snapshot(model_name: str) -> str | None:
     return str(snapshot) if snapshot.is_dir() else None
 
 
-def _local_or_repo(repo: str) -> str:
-    """The cached snapshot path when present (loads with no network), else the repo id."""
-    return _cached_snapshot(repo) or repo
+def _missing_files(snapshot: Path, source: Source) -> list[str]:
+    missing = [f for f in source.required if not (snapshot / f).is_file()]
+    index = snapshot / "model.safetensors.index.json"
+    if not missing and index.is_file():  # sharded weights: every shard must be there too
+        shards = set(json.loads(index.read_text())["weight_map"].values())
+        missing += [shard for shard in sorted(shards) if not (snapshot / shard).is_file()]
+    return missing
 
 
-def _installed_models() -> list[str]:
-    """Repo ids of diffusers pipelines present in the local HF cache. Auxiliary repos
-    (community pipeline code, LoRAs, the VL processor) have no model_index.json."""
-    root = Path(HF_HUB_CACHE)
-    if not root.is_dir():
-        return []
-    out: list[str] = []
-    for entry in root.glob("models--*"):
-        repo = entry.name[len("models--"):].replace("--", "/")
-        snapshot = _cached_snapshot(repo)
-        if snapshot and (Path(snapshot) / "model_index.json").is_file():
-            out.append(repo)
-    return sorted(out)
+def _snapshot(source: Source) -> Path:
+    """Local snapshot directory holding `source`.
+
+    A complete cached copy is ALWAYS used with the network untouched, so a stray
+    HEAD/etag check can never stall startup. Only missing files are downloaded,
+    and never when offline mode is forced (that errors at once instead of hanging).
+    """
+    cached = _cached_snapshot(source.repo)
+    missing = _missing_files(Path(cached), source) if cached else list(source.required)
+    if cached and not missing:
+        return Path(cached)
+    if IMAGEGEN_OFFLINE:
+        raise FileNotFoundError(
+            f"{source.repo} is missing {missing or 'its files'} locally and IMAGEGEN_OFFLINE is set "
+            "(fetch with ./infra.sh pull-models)"
+        )
+    logger.info("Downloading %s %s", source.repo, list(source.patterns))
+    return Path(snapshot_download(source.repo, allow_patterns=list(source.patterns)))
+
+
+def _is_installed(model_name: str) -> bool:
+    """Whether a variant's transformer file is already in the local cache."""
+    cached = _cached_snapshot(TRANSFORMER_REPO)
+    return bool(cached) and not _missing_files(Path(cached), transformer_source(model_name))
+
+
+@functools.cache
+def _community_classes():
+    """(pipeline class, transformer class) from the community pipeline.py, imported
+    straight from the local snapshot."""
+    path = _snapshot(pipeline_source()) / "pipeline.py"
+    spec = importlib.util.spec_from_file_location("krea2_community_pipeline", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.Krea2OstrisEditPipeline, module.Krea2Transformer2DModel
 
 
 def _load_style_lora(pipe: DiffusionPipeline) -> bool:
     """Load the style-reference LoRA as a disabled adapter; requests enable it per
     render. Failure only disables reference_mode=style."""
-    lora = style_lora()
-    if lora is None:
+    source = style_lora_source()
+    if source is None:
         return False
-    repo, weight = lora
     try:
-        pipe.load_lora_weights(_local_or_repo(repo), weight_name=weight, adapter_name=STYLE_ADAPTER)
+        weight = source.required[0] if source.required else None
+        pipe.load_lora_weights(str(_snapshot(source)), weight_name=weight, adapter_name=STYLE_ADAPTER)
         pipe.transformer.disable_adapters()
         # PEFT creates adapters in fp32; the LoRA ships in bf16, so this is lossless.
         for name, param in pipe.transformer.named_parameters():
@@ -127,81 +162,47 @@ def _load_style_lora(pipe: DiffusionPipeline) -> bool:
                 param.data = param.data.to(torch.bfloat16)
     except Exception as exc:
         logger.warning("Style LoRA %s unavailable (%s: %s); reference_mode=style disabled",
-                       repo, type(exc).__name__, exc)
+                       source.repo, type(exc).__name__, exc)
         return False
-    logger.info("Style LoRA loaded: %s", repo)
+    logger.info("Style LoRA loaded: %s", source.repo)
     return True
 
 
 def _prepare_reference_processor(pipe: DiffusionPipeline) -> None:
-    """Point the pipeline's lazily-built Qwen3-VL processor at the local cache and
-    build it now, so the first reference request never reaches the network."""
-    repo = getattr(pipe, "vl_processor_id", VL_PROCESSOR_REPO)
-    pipe.vl_processor_id = _local_or_repo(repo)
+    """Build the pipeline's lazily-loaded Qwen3-VL processor now, so a broken
+    processor shows up at startup instead of on the first reference request."""
     try:
         pipe.vl_processor
     except Exception as exc:
         logger.warning(
-            "Reference-image processor %s unavailable (%s: %s); /v1/images/edits will fail "
-            "until it is fetched (./infra.sh pull-models)",
-            repo, type(exc).__name__, exc,
+            "Reference-image processor unavailable (%s: %s); /v1/images/edits will fail",
+            type(exc).__name__, exc,
         )
 
 
-def _fp8_transformer_path(filename: str) -> str:
-    """Local path of a Comfy fp8 transformer file: the cache when present (no
-    network), else a download unless offline mode is forced."""
-    try:
-        return hf_hub_download(FP8_TRANSFORMER_REPO, filename, local_files_only=True)
-    except LocalEntryNotFoundError:
-        if IMAGEGEN_OFFLINE:
-            raise
-    logger.info("Downloading fp8 transformer %s/%s", FP8_TRANSFORMER_REPO, filename)
-    return hf_hub_download(FP8_TRANSFORMER_REPO, filename)
-
-
-def _install_fp8_transformer(pipe: DiffusionPipeline, source: str, local_only: bool, filename: str) -> None:
-    """Build the pipeline's transformer from Comfy's pre-scaled fp8 file."""
-    # The transformer class lives in the community pipeline module.
-    transformer_cls = sys.modules[type(pipe).__module__].Krea2Transformer2DModel
-    config = transformer_cls.load_config(source, subfolder="transformer", local_files_only=local_only)
-    path = _fp8_transformer_path(filename)
-    logger.info("Loading fp8 transformer from %s", path)
-    pipe.register_modules(transformer=load_scaled_fp8_transformer(transformer_cls, config, path))
-
-
 def _load_pipeline(model_name: str) -> tuple[DiffusionPipeline, bool]:
-    """Load `model_name` through the reference-capable community pipeline.
+    """Assemble Krea 2 `model_name` from its ungated sources.
     Returns (pipeline, style_lora_loaded)."""
+    if model_name not in VARIANTS:
+        raise ValueError(f"unknown image model {model_name!r}; expected one of {sorted(VARIANTS)}")
     logger.info("Loading image generation pipeline: %s (pipeline %s)", model_name, IMAGEGEN_PIPELINE)
-    # A model that's present locally is ALWAYS loaded with the network disabled, so
-    # a stray HEAD/etag check can never stall startup — and we never silently fall
-    # back to a (hang-prone) download. Only a genuinely-missing model reaches out,
-    # and only when offline mode isn't forced.
-    cached = _cached_snapshot(model_name)
-    if cached is not None:
-        logger.info("Found in local cache; loading offline from %s", cached)
-        source, local_only = cached, True
-    elif IMAGEGEN_OFFLINE:
-        # Our resolver missed it but offline is forced — let HF's own cache lookup
-        # try (network off): it either loads or raises at once, never hangs.
-        logger.info("Not resolved locally; trying HF offline cache for %s", model_name)
-        source, local_only = model_name, True
-    else:
-        logger.info("Not cached; downloading from HuggingFace: %s", model_name)
-        source, local_only = model_name, False
-    fp8_file = fp8_transformer_file(model_name)
-    # With an fp8 file the repo's own bf16 transformer is skipped entirely.
-    components = {"transformer": None} if fp8_file else {}
-    pipe = DiffusionPipeline.from_pretrained(
-        source,
-        custom_pipeline=_local_or_repo(IMAGEGEN_PIPELINE),
-        torch_dtype=torch.bfloat16,
-        local_files_only=local_only,
-        **components,
+    pipeline_cls, transformer_cls = _community_classes()
+    transformer = transformer_source(model_name)
+    transformer_path = _snapshot(transformer) / transformer.required[0]
+    logger.info("Loading transformer from %s", transformer_path)
+    qwen = str(_snapshot(QWEN_VL))
+    pipe = pipeline_cls(
+        scheduler=FlowMatchEulerDiscreteScheduler(**SCHEDULER_CONFIG),
+        vae=AutoencoderKLQwenImage.from_pretrained(
+            str(_snapshot(VAE)), subfolder=VAE_SUBFOLDER, torch_dtype=torch.bfloat16
+        ),
+        text_encoder=Qwen3VLModel.from_pretrained(qwen, dtype=torch.bfloat16),
+        tokenizer=AutoTokenizer.from_pretrained(qwen),
+        transformer=load_comfy_transformer(transformer_cls, str(transformer_path)),
+        is_distilled=VARIANTS[model_name].is_distilled,
     )
-    if fp8_file:
-        _install_fp8_transformer(pipe, source, local_only, fp8_file)
+    # The reference-image processor comes from the same (local) Qwen3-VL snapshot.
+    pipe.vl_processor_id = qwen
     has_style = _load_style_lora(pipe)
     _prepare_reference_processor(pipe)
     # Transformer (~13 GB in fp8) and text encoder (~9 GB) don't fit together on
@@ -569,14 +570,14 @@ class LoadModelRequest(BaseModel):
 
 @app.get("/v1/images/models")
 async def list_image_models() -> JSONResponse:
-    """List image models present in the local cache and which one is loaded."""
+    """List the Krea 2 variants, whether each is downloaded, and which is loaded."""
     current = app.state.model_name
-    ids = set(_installed_models())
-    if current:
-        ids.add(current)  # the loaded model is available even if the scan missed it
     return JSONResponse(content={
         "current": current,
-        "data": [{"id": m, "loaded": m == current} for m in sorted(ids)],
+        "data": [
+            {"id": m, "loaded": m == current, "downloaded": m == current or _is_installed(m)}
+            for m in sorted(VARIANTS)
+        ],
     })
 
 
@@ -587,7 +588,10 @@ async def load_image_model(body: LoadModelRequest) -> JSONResponse:
     model = body.model.strip()
     if not model:
         return _error(400, "model is required", param="model")
-    if IMAGEGEN_OFFLINE and _cached_snapshot(model) is None:
+    # Checked before the swap, which unloads the current model first.
+    if model not in VARIANTS:
+        return _error(400, f"unknown model {model!r}; expected one of {sorted(VARIANTS)}", param="model")
+    if IMAGEGEN_OFFLINE and not _is_installed(model):
         return _error(400, f"model {model!r} is not in the local cache and IMAGEGEN_OFFLINE is set",
                       param="model")
     logger.info("Loading image model: %s", model)

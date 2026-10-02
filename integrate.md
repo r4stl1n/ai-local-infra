@@ -243,7 +243,7 @@ once the model is warm.
 | Field | Default | Notes |
 |---|---|---|
 | `prompt` | required | 400 if empty. No 77-token limit — Krea 2 encodes prompts with a Qwen3-VL LLM, so long, descriptive prompts work well |
-| `negative_prompt` | `""` | Only takes effect with CFG (`krea/Krea-2-Raw`); ignored by the default Turbo model |
+| `negative_prompt` | `""` | Only takes effect with CFG (`krea2-raw`); ignored by the default Turbo model |
 | `size` | `"1024x1024"` | `"WxH"`, each dimension clamped to 256–1536 and snapped to a multiple of 16 (so `1536x1024` / `1024x1536` work). `"auto"` = `1024x1024` |
 | `n` | `1` | 1–4 images (generated sequentially) |
 | `model` | ignored | Server uses its configured diffusion model |
@@ -299,14 +299,15 @@ frees its VRAM. Loads are slow (weights + VRAM) and the request blocks until
 the new model is ready.
 
 ```
-GET  /v1/images/models              -> {"current": "<repo>", "data": [{"id": "<repo>", "loaded": bool}, ...]}
-POST /v1/images/models/load  {"model": "<repo>"}   -> {"current": "<repo>"}
+GET  /v1/images/models              -> {"current": "krea2-turbo", "data": [{"id": "krea2-turbo", "loaded": bool, "downloaded": bool}, ...]}
+POST /v1/images/models/load  {"model": "krea2-raw"} -> {"current": "krea2-raw"}
 POST /v1/images/models/unload                      -> {"current": null}
 ```
 
-`data` lists the image checkpoints present in the local cache. With
-`IMAGEGEN_OFFLINE=1`, `load` refuses a model that isn't already cached
-(400) rather than trying to download it.
+`data` lists the Krea 2 variants (`krea2-turbo`, `krea2-raw`) and whether each
+is downloaded; loading one that isn't downloads it first. An unknown id is a
+`400` and leaves the current model loaded. With `IMAGEGEN_OFFLINE=1`, `load`
+refuses a model that isn't already cached (400) rather than downloading it.
 
 ---
 
@@ -320,7 +321,7 @@ GET  /v1/models/loaded                       -> {"data": [{"id": "gemma4:12b", "
 POST /v1/models/unload  {"model": "<id>"}    -> {"unloaded": ["<id>"]}
 POST /v1/models/unload  (no body)            -> {"unloaded": [<every resident model>]}
 POST /v1/images/models/unload                -> {"current": null}
-POST /v1/images/models/load {"model": "<repo>"} -> {"current": "<repo>"}
+POST /v1/images/models/load {"model": "krea2-turbo"} -> {"current": "krea2-turbo"}
 ```
 
 - `/v1/models/*` acts on the bundled Ollama, which hosts the chat models

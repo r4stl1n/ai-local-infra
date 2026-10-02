@@ -30,7 +30,7 @@ With `LLM_PROVIDER=remote`, chat and `/v1/models` proxy to `LLM_URL`, which may 
 
 - Docker with Compose v2 (`docker compose`)
 - NVIDIA GPU with drivers and [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (ollama, whisper, imagegen)
-- For image generation: a HuggingFace account that has accepted the [Krea 2 license](https://huggingface.co/krea/Krea-2-Turbo), a 24 GB GPU, ~23 GB of disk and ~32 GB of system RAM. It uses the same pre-scaled fp8 transformer as ComfyUI ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2), ~13 GB instead of 26 GB in bf16), and CPU offload keeps only one component on the GPU at a time
+- For image generation: a 24 GB GPU, ~23 GB of disk and ~32 GB of system RAM. It uses the same pre-scaled fp8 transformer as ComfyUI ([Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2), ~13 GB instead of 26 GB in bf16), and CPU offload keeps only one component on the GPU at a time
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ With `LLM_PROVIDER=remote`, chat and `/v1/models` proxy to `LLM_URL`, which may 
 ./infra.sh status
 ```
 
-For image generation, accept the [Krea 2 license](https://huggingface.co/krea/Krea-2-Turbo) and set `HF_TOKEN` in `.env` (a HuggingFace read token) before `pull-models` or the first start — the weights are gated and the download fails without it.
+Image generation needs no HuggingFace account: every weight comes from an ungated repo — the Krea 2 transformer from [Comfy-Org/Krea-2](https://huggingface.co/Comfy-Org/Krea-2), the text encoder and VAE from Qwen's own repos (they're the stock Qwen3-VL-4B-Instruct and Qwen-Image VAE). The [Krea 2 Community License](https://huggingface.co/krea/Krea-2-Turbo) still applies to the model.
 
 On first run `infra.sh` creates `.env` with a freshly generated `API_KEY` — read it back with `grep '^API_KEY=' .env` and give it to your clients. If you copy `.env.example` by hand instead, set `API_KEY` yourself (`openssl rand -hex 32`); the gateway refuses to start with an empty key rather than run unauthenticated. Model weights and caches live in `.data/` next to this file.
 
@@ -60,12 +60,11 @@ Once the models are downloaded, the stack starts fully offline: every service lo
 | `ENABLE_STT` / `ENABLE_TTS` / `ENABLE_IMAGEGEN` | `true` | Toggle the optional services (compose profiles) |
 | `WHISPER_MODEL` | `large-v3-turbo` | Whisper model size |
 | `TTS_MODEL` | `KittenML/kitten-tts-nano-0.8` | KittenTTS model |
-| `IMAGEGEN_MODEL` | `krea/Krea-2-Turbo` | Image model: `krea/Krea-2-Turbo` (8-step distillate) or `krea/Krea-2-Raw` (28 steps, CFG). Both are gated — accept the license on the HF model page and set `HF_TOKEN` |
-| `HF_TOKEN` | _(empty)_ | HuggingFace read token, required to download the gated Krea 2 weights |
+| `IMAGEGEN_MODEL` | `krea2-turbo` | Image model: `krea2-turbo` (8-step distillate) or `krea2-raw` (28 steps, CFG) |
 | `IMAGEGEN_STEPS` / `IMAGEGEN_GUIDANCE` | _(empty)_ | Override inference steps / CFG scale; empty uses the checkpoint's defaults (Turbo `8` / `0.0`, Raw `28` / `4.5`) |
 | `IMAGEGEN_STYLE_LORA` | `ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors` | LoRA (`repo:weight_file`) behind `reference_mode=style` on `/v1/images/edits`; empty disables style mode |
 | `IMAGEGEN_PIPELINE` | `ostris/Krea2OstrisEdit` | Diffusers community pipeline that adds reference-image conditioning to Krea 2 |
-| `IMAGEGEN_FP8` | `1` | Use ComfyUI's pre-scaled fp8 transformer (`Comfy-Org/Krea-2`, ~13 GB, computed in bf16) so Krea 2 fits a 24 GB GPU; the text encoder, VAE and configs still come from `IMAGEGEN_MODEL`. `0` = the model repo's bf16 transformer (~26 GB, needs a ~32 GB+ GPU) |
+| `IMAGEGEN_FP8` | `1` | Use ComfyUI's pre-scaled fp8 transformer (`Comfy-Org/Krea-2`, ~13 GB, computed in bf16) so Krea 2 fits a 24 GB GPU; `0` = its bf16 transformer (~26 GB, needs a ~32 GB+ GPU) |
 | `IMAGEGEN_OFFLINE` | `0` | `1` = never fetch image weights over the network; cached models load, missing ones error fast instead of hanging. Pre-fetch with `./infra.sh pull-models` |
 
 The active image model can also be listed/swapped/unloaded at runtime via

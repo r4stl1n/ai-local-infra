@@ -1,10 +1,9 @@
-"""Load ComfyUI's pre-scaled fp8 Krea 2 transformer into the diffusers model.
+"""Load a Comfy-Org Krea 2 transformer file into the diffusers model.
 
 Comfy-Org/Krea-2 ships the transformer as one safetensors file in the original
-Krea key layout, with every block linear stored as float8_e4m3fn plus a per-tensor
-`weight_scale` (dequantized weight = fp8 * scale). It halves the ~26 GB bf16
-transformer to ~13 GB, and unlike a plain fp8 cast, the scale keeps small weights
-out of fp8's subnormal range.
+Krea key layout, either in bf16 or "fp8_scaled": every block linear stored as
+float8_e4m3fn plus a per-tensor `weight_scale` (dequantized weight = fp8 * scale),
+which halves the ~26 GB bf16 transformer to ~13 GB.
 """
 
 from __future__ import annotations
@@ -97,8 +96,9 @@ def _to_scaled_fp8(linear: nn.Linear, scale: torch.Tensor) -> None:
     linear.__class__ = ScaledFP8Linear
 
 
-def load_scaled_fp8_transformer(transformer_cls, config: dict, path: str) -> nn.Module:
-    """Build `transformer_cls(config)` with weights from a Comfy fp8_scaled file."""
+def load_comfy_transformer(transformer_cls, path: str) -> nn.Module:
+    """Build `transformer_cls` with weights from a Comfy-Org bf16 or fp8_scaled file.
+    The class defaults are the released Krea 2 config."""
     state = load_file(path)
     scales = {key[: -len(_SCALE_SUFFIX)]: state.pop(key) for key in list(state) if key.endswith(_SCALE_SUFFIX)}
 
@@ -111,12 +111,12 @@ def load_scaled_fp8_transformer(transformer_cls, config: dict, path: str) -> nn.
 
     # Parameters on meta (no allocation); buffers such as rotary tables stay real.
     with init_empty_weights(include_buffers=False):
-        model = transformer_cls.from_config(config)
+        model = transformer_cls()
     expected = model.state_dict()
     missing = sorted(set(expected) - set(converted))
     unexpected = sorted(set(converted) - set(expected))
     if missing or unexpected:
-        raise ValueError(f"fp8 transformer does not match the model: missing={missing[:5]} unexpected={unexpected[:5]}")
+        raise ValueError(f"transformer file does not match the model: missing={missing[:5]} unexpected={unexpected[:5]}")
     for key, tensor in converted.items():
         shape = expected[key].shape
         if tensor.shape != shape:
