@@ -162,6 +162,10 @@ services:
       - HF_HUB_OFFLINE=${IMAGEGEN_OFFLINE:-0}
       - TRANSFORMERS_OFFLINE=${IMAGEGEN_OFFLINE:-0}
       - HF_HOME=/data/imagegen
+      # Compiled GPU kernels: on the volume (the container user may have no home
+      # dir) so they persist across restarts instead of recompiling.
+      - TRITON_CACHE_DIR=/data/imagegen/triton
+      - TORCHINDUCTOR_CACHE_DIR=/data/imagegen/inductor
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./.data/imagegen:/data/imagegen

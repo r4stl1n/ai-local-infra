@@ -95,6 +95,11 @@ docker run --rm -v $PWD/services/api:/src -w /src -e API_KEY=test \
 # End-to-end audio round-trip against the running stack (stdlib only):
 # TTS generates a sample, Whisper transcribes it back
 python3 -m unittest discover -s tests/e2e -v
+
+# End-to-end Krea 2 check: text-to-image, reference images, style mode and
+# request validation; writes the images to ./imagegen-test-out for a visual check.
+# --vram also cycles the LLM/image unload + reload endpoints.
+tests/e2e/test_imagegen.sh [--vram]
 ```
 
 The e2e tests read `API_KEY` from the environment or `.env`, and target `E2E_API_URL` (default `http://localhost:8000`).
