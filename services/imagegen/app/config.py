@@ -89,10 +89,15 @@ IMAGEGEN_STEPS: int | None = _optional("IMAGEGEN_STEPS", int)
 IMAGEGEN_GUIDANCE: float | None = _optional("IMAGEGEN_GUIDANCE", float)
 # Pre-scaled fp8 transformer (~13 GB, fits a 24 GB GPU) instead of bf16 (~26 GB).
 IMAGEGEN_FP8 = _is_truthy(os.getenv("IMAGEGEN_FP8", "1"))
-# LoRA used for reference_mode=style ("repo" or "repo:weight_file"); empty disables it.
+# Reference images only work through a LoRA trained on them (ostris AI Toolkit's
+# Krea 2 reference trainer); base Krea 2 garbles them into mosaic blocks. Each
+# /v1/images/edits reference_mode is backed by one ("repo" or "repo:weight_file";
+# empty disables the mode).
 IMAGEGEN_STYLE_LORA = os.getenv(
     "IMAGEGEN_STYLE_LORA", "ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors"
 ).strip()
+# No general-purpose Krea 2 edit LoRA is published yet, so edit mode is off by default.
+IMAGEGEN_EDIT_LORA = os.getenv("IMAGEGEN_EDIT_LORA", "").strip()
 # When set, never touch the network: cached files load, missing ones error
 # immediately instead of hanging on an unreachable HuggingFace.
 IMAGEGEN_OFFLINE = _is_truthy(os.getenv("IMAGEGEN_OFFLINE"))
@@ -110,11 +115,14 @@ def pipeline_source() -> Source:
     return Source(IMAGEGEN_PIPELINE, patterns=("*.py",), required=("pipeline.py",))
 
 
-def style_lora_source() -> Source | None:
-    """Where the style LoRA lives, or None when disabled."""
-    if not IMAGEGEN_STYLE_LORA:
-        return None
-    repo, _, weight = IMAGEGEN_STYLE_LORA.partition(":")
+def _lora_source(spec: str) -> Source:
+    repo, _, weight = spec.partition(":")
     if weight:
         return Source(repo, patterns=(weight,), required=(weight,))
     return Source(repo, patterns=("*.safetensors",), required=())
+
+
+def reference_lora_sources() -> dict[str, Source]:
+    """The configured LoRA for each reference_mode."""
+    specs = {"style": IMAGEGEN_STYLE_LORA, "edit": IMAGEGEN_EDIT_LORA}
+    return {mode: _lora_source(spec) for mode, spec in specs.items() if spec}

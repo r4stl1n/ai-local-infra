@@ -46,7 +46,7 @@ from app.config import (
     VARIANTS,
     Source,
     pipeline_source,
-    style_lora_source,
+    reference_lora_sources,
     transformer_source,
 )
 from app.fp8 import load_comfy_transformer
@@ -57,6 +57,7 @@ _ENV_KEYS = (
     "IMAGEGEN_STEPS",
     "IMAGEGEN_GUIDANCE",
     "IMAGEGEN_STYLE_LORA",
+    "IMAGEGEN_EDIT_LORA",
     "IMAGEGEN_FP8",
     "IMAGEGEN_OFFLINE",
     "HF_HOME",
@@ -64,7 +65,6 @@ _ENV_KEYS = (
     "LOG_LEVEL",
 )
 _SENSITIVE_ENV_MARKERS = ("PASSWORD", "TOKEN", "KEY", "SECRET")
-STYLE_ADAPTER = "style"
 
 logger = logging.getLogger("imagegen")
 logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
@@ -146,26 +146,28 @@ def _community_classes():
     return module.Krea2OstrisEditPipeline, module.Krea2Transformer2DModel
 
 
-def _load_style_lora(pipe: DiffusionPipeline) -> bool:
-    """Load the style-reference LoRA as a disabled adapter; requests enable it per
-    render. Failure only disables reference_mode=style."""
-    source = style_lora_source()
-    if source is None:
-        return False
-    try:
-        weight = source.required[0] if source.required else None
-        pipe.load_lora_weights(str(_snapshot(source)), weight_name=weight, adapter_name=STYLE_ADAPTER)
+def _load_reference_loras(pipe: DiffusionPipeline) -> frozenset[str]:
+    """Load each configured reference-mode LoRA as a disabled adapter named after
+    its mode; requests enable one per render. Returns the modes that loaded — a
+    LoRA that fails only disables its own mode."""
+    loaded = set()
+    for mode, source in reference_lora_sources().items():
+        try:
+            weight = source.required[0] if source.required else None
+            pipe.load_lora_weights(str(_snapshot(source)), weight_name=weight, adapter_name=mode)
+        except Exception as exc:
+            logger.warning("%s LoRA %s unavailable (%s: %s); reference_mode=%s disabled",
+                           mode, source.repo, type(exc).__name__, exc, mode)
+            continue
+        loaded.add(mode)
+        logger.info("%s LoRA loaded: %s", mode, source.repo)
+    if loaded:
         pipe.transformer.disable_adapters()
-        # PEFT creates adapters in fp32; the LoRA ships in bf16, so this is lossless.
+        # PEFT creates adapters in fp32; the LoRAs ship in bf16, so this is lossless.
         for name, param in pipe.transformer.named_parameters():
             if "lora_" in name:
                 param.data = param.data.to(torch.bfloat16)
-    except Exception as exc:
-        logger.warning("Style LoRA %s unavailable (%s: %s); reference_mode=style disabled",
-                       source.repo, type(exc).__name__, exc)
-        return False
-    logger.info("Style LoRA loaded: %s", source.repo)
-    return True
+    return frozenset(loaded)
 
 
 def _prepare_reference_processor(pipe: DiffusionPipeline) -> None:
@@ -180,9 +182,9 @@ def _prepare_reference_processor(pipe: DiffusionPipeline) -> None:
         )
 
 
-def _load_pipeline(model_name: str) -> tuple[DiffusionPipeline, bool]:
+def _load_pipeline(model_name: str) -> tuple[DiffusionPipeline, frozenset[str]]:
     """Assemble Krea 2 `model_name` from its ungated sources.
-    Returns (pipeline, style_lora_loaded)."""
+    Returns (pipeline, reference modes whose LoRA loaded)."""
     if model_name not in VARIANTS:
         raise ValueError(f"unknown image model {model_name!r}; expected one of {sorted(VARIANTS)}")
     logger.info("Loading image generation pipeline: %s (pipeline %s)", model_name, IMAGEGEN_PIPELINE)
@@ -203,13 +205,13 @@ def _load_pipeline(model_name: str) -> tuple[DiffusionPipeline, bool]:
     )
     # The reference-image processor comes from the same (local) Qwen3-VL snapshot.
     pipe.vl_processor_id = qwen
-    has_style = _load_style_lora(pipe)
+    reference_modes = _load_reference_loras(pipe)
     _prepare_reference_processor(pipe)
     # Transformer (~13 GB in fp8) and text encoder (~9 GB) don't fit together on
     # a 24 GB GPU: offload keeps only the active component there.
     pipe.enable_model_cpu_offload()
     logger.info("Image generation pipeline loaded (model CPU offload)")
-    return pipe, has_style
+    return pipe, reference_modes
 
 
 def _free_pipeline(pipe) -> None:
@@ -234,9 +236,9 @@ def _free_pipeline(pipe) -> None:
         torch.cuda.empty_cache()
 
 
-def _install(app: FastAPI, model_name: str | None, pipe, has_style: bool) -> None:
+def _install(app: FastAPI, model_name: str | None, pipe, reference_modes: frozenset[str]) -> None:
     app.state.pipeline = pipe
-    app.state.has_style = has_style
+    app.state.reference_modes = reference_modes
     app.state.model_name = model_name
 
 
@@ -245,17 +247,17 @@ def _swap_pipeline(app: FastAPI, model_name: str) -> None:
     so it can never race an in-flight generation."""
     with app.state.lock:
         old = app.state.pipeline
-        _install(app, None, None, False)
+        _install(app, None, None, frozenset())
         _free_pipeline(old)
-        pipe, has_style = _load_pipeline(model_name)
-        _install(app, model_name, pipe, has_style)
+        pipe, reference_modes = _load_pipeline(model_name)
+        _install(app, model_name, pipe, reference_modes)
 
 
 def _unload_pipeline(app: FastAPI) -> None:
     """Unload the current model and free its VRAM, leaving nothing loaded."""
     with app.state.lock:
         old = app.state.pipeline
-        _install(app, None, None, False)
+        _install(app, None, None, frozenset())
         _free_pipeline(old)
 
 
@@ -264,8 +266,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _log_startup_env("imagegen", _ENV_KEYS)
     # Serializes generation against model swaps (both run in worker threads).
     app.state.lock = threading.Lock()
-    pipe, has_style = _load_pipeline(IMAGEGEN_MODEL)
-    _install(app, IMAGEGEN_MODEL, pipe, has_style)
+    pipe, reference_modes = _load_pipeline(IMAGEGEN_MODEL)
+    _install(app, IMAGEGEN_MODEL, pipe, reference_modes)
     yield
 
 
@@ -324,10 +326,11 @@ def _parse_size(size: str, reference: Image.Image | None = None) -> tuple[int, i
     return _clamp_dimension(rw * scale), _clamp_dimension(rh * scale)
 
 
-def _set_style_adapter(pipe: DiffusionPipeline, enabled: bool) -> None:
-    if enabled:
+def _set_adapter(pipe: DiffusionPipeline, adapter: str | None) -> None:
+    """Activate one reference-mode LoRA, or none."""
+    if adapter:
         pipe.transformer.enable_adapters()
-        pipe.set_adapters(STYLE_ADAPTER)
+        pipe.set_adapters(adapter)
     else:
         pipe.transformer.disable_adapters()
 
@@ -339,7 +342,7 @@ def _generate(
     width: int,
     height: int,
     references: list[Image.Image] | None = None,
-    style: bool = False,
+    adapter: str | None = None,
 ) -> Image.Image:
     # Held for the whole render so a model swap can't pull the pipeline out from
     # under us mid-generation.
@@ -347,13 +350,13 @@ def _generate(
         pipe = app.state.pipeline
         if pipe is None:
             raise RuntimeError("no image model is loaded")
-        if style:
-            _set_style_adapter(pipe, True)
+        if adapter:
+            _set_adapter(pipe, adapter)
         try:
             return _render(pipe, prompt, negative_prompt, width, height, references)
         finally:
-            if style:
-                _set_style_adapter(pipe, False)
+            if adapter:
+                _set_adapter(pipe, None)
             # Offload already moved the weights to CPU; hand the allocator's cached
             # blocks back too, so an idle imagegen leaves the VRAM to Ollama.
             if torch.cuda.is_available():
@@ -400,9 +403,10 @@ class ImageRequest(BaseModel):
 
 class EditRequest(ImageRequest):
     size: str = "auto"
-    # edit: generate with the references as context (subject/edit/composition).
     # style: render the prompt in the references' style (style-reference LoRA).
-    reference_mode: Literal["edit", "style"] = "edit"
+    # edit: generate with the references as context (subject/edit/composition);
+    # only available when an edit LoRA is configured (IMAGEGEN_EDIT_LORA).
+    reference_mode: Literal["style", "edit"] = "style"
 
 
 class _RequestError(Exception):
@@ -507,7 +511,7 @@ async def _generate_response(
     width: int,
     height: int,
     references: list[Image.Image] | None = None,
-    style: bool = False,
+    adapter: str | None = None,
 ) -> JSONResponse:
     if app.state.pipeline is None:
         return _error(503, "no image model is loaded", "api_error")
@@ -520,7 +524,7 @@ async def _generate_response(
         width,
         height,
         len(references or ()),
-        " (style)" if style else "",
+        f" ({adapter})" if adapter else "",
         body.prompt[:120],
         body.negative_prompt[:120],
     )
@@ -530,7 +534,7 @@ async def _generate_response(
     for i in range(body.n):
         try:
             image = await asyncio.to_thread(
-                _generate, app, body.prompt, body.negative_prompt, width, height, references, style
+                _generate, app, body.prompt, body.negative_prompt, width, height, references, adapter
             )
         except torch.cuda.OutOfMemoryError:
             logger.exception("GPU out of memory generating a %dx%d image", width, height)
@@ -565,15 +569,17 @@ async def edit_image(request: Request) -> JSONResponse:
     except _RequestError as exc:
         return _error(400, exc.message, param=exc.param)
 
-    style = body.reference_mode == "style"
-    if style and not app.state.has_style:
+    mode = body.reference_mode
+    if mode not in app.state.reference_modes:
+        env = "IMAGEGEN_EDIT_LORA" if mode == "edit" else "IMAGEGEN_STYLE_LORA"
         return _error(
             400,
-            "reference_mode=style needs the style LoRA, which is not loaded (see IMAGEGEN_STYLE_LORA)",
+            f"reference_mode={mode} is unavailable: its LoRA is not loaded (set {env}); "
+            f"available: {sorted(app.state.reference_modes) or 'none'}",
             param="reference_mode",
         )
     width, height = _parse_size(body.size, references[0])
-    return await _generate_response(body, width, height, references, style)
+    return await _generate_response(body, width, height, references, mode)
 
 
 class LoadModelRequest(BaseModel):
@@ -582,10 +588,12 @@ class LoadModelRequest(BaseModel):
 
 @app.get("/v1/images/models")
 async def list_image_models() -> JSONResponse:
-    """List the Krea 2 variants, whether each is downloaded, and which is loaded."""
+    """List the Krea 2 variants, whether each is downloaded, and which is loaded,
+    plus the /v1/images/edits reference modes the loaded model supports."""
     current = app.state.model_name
     return JSONResponse(content={
         "current": current,
+        "reference_modes": sorted(app.state.reference_modes),
         "data": [
             {"id": m, "loaded": m == current, "downloaded": m == current or _is_installed(m)}
             for m in sorted(VARIANTS)

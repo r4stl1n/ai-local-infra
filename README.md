@@ -12,7 +12,7 @@ Self-hosted model-serving stack for any OpenAI-compatible client. Runs an authen
 | **imagegen** | Text-to-image and reference-image generation (Krea 2 Turbo, GPU) | internal |
 | **demucs** | Music source separation (vocals/stems, Demucs, GPU; off by default) | internal |
 
-All traffic goes through **api**, which requires `Authorization: Bearer ${API_KEY}` and exposes `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/audio/transcriptions` (plus a `/v1/audio/transcriptions/stream` WebSocket), `/v1/audio/speech`, `/v1/images/generations`, `/v1/images/edits` (generation from 1–2 reference images), and `/v1/audio/separations` (stem separation, when enabled), plus `/health`. To share limited VRAM, `/v1/models/loaded` + `/v1/models/unload` (LLM/embeddings) and `/v1/images/models/load|unload` (image model) free one side for the other. The model services themselves are not published; add port mappings in `docker-compose.yml` if you need direct access.
+All traffic goes through **api**, which requires `Authorization: Bearer ${API_KEY}` and exposes `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/audio/transcriptions` (plus a `/v1/audio/transcriptions/stream` WebSocket), `/v1/audio/speech`, `/v1/images/generations`, `/v1/images/edits` (generation from 1–2 reference images: style reference, plus edits when an edit LoRA is configured), and `/v1/audio/separations` (stem separation, when enabled), plus `/health`. To share limited VRAM, `/v1/models/loaded` + `/v1/models/unload` (LLM/embeddings) and `/v1/images/models/load|unload` (image model) free one side for the other. The model services themselves are not published; add port mappings in `docker-compose.yml` if you need direct access.
 
 ## OpenAI compatibility
 
@@ -62,7 +62,8 @@ Once the models are downloaded, the stack starts fully offline: every service lo
 | `TTS_MODEL` | `KittenML/kitten-tts-nano-0.8` | KittenTTS model |
 | `IMAGEGEN_MODEL` | `krea2-turbo` | Image model: `krea2-turbo` (8-step distillate) or `krea2-raw` (28 steps, CFG) |
 | `IMAGEGEN_STEPS` / `IMAGEGEN_GUIDANCE` | _(empty)_ | Override inference steps / CFG scale; empty uses the checkpoint's defaults (Turbo `8` / `0.0`, Raw `28` / `4.5`) |
-| `IMAGEGEN_STYLE_LORA` | `ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors` | LoRA (`repo:weight_file`) behind `reference_mode=style` on `/v1/images/edits`; empty disables style mode |
+| `IMAGEGEN_STYLE_LORA` | `ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors` | LoRA (`repo:weight_file`) behind `reference_mode=style` on `/v1/images/edits` (render the prompt in a reference's style); empty disables style mode |
+| `IMAGEGEN_EDIT_LORA` | _(empty)_ | LoRA behind `reference_mode=edit` (subject reference / edits). Off by default: no general Krea 2 edit LoRA is published yet, and without one Krea 2 garbles reference images; train one with [AI Toolkit](https://github.com/ostris/ai-toolkit)'s Krea 2 reference trainer to enable it |
 | `IMAGEGEN_PIPELINE` | `ostris/Krea2OstrisEdit` | Diffusers community pipeline that adds reference-image conditioning to Krea 2 |
 | `IMAGEGEN_FP8` | `1` | Use ComfyUI's pre-scaled fp8 transformer (`Comfy-Org/Krea-2`, ~13 GB, computed in bf16) so Krea 2 fits a 24 GB GPU; `0` = its bf16 transformer (~26 GB, needs a ~32 GB+ GPU) |
 | `IMAGEGEN_OFFLINE` | `0` | `1` = never fetch image weights over the network; cached models load, missing ones error fast instead of hanging. Pre-fetch with `./infra.sh pull-models` |
