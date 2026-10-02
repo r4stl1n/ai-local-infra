@@ -15,7 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.config import settings
 from app.errors import error_body, error_response, normalized_error_content
 from app.logging import get_logger
-from app.routes import chat, embeddings, imagegen, models, separation, stt, tts
+from app.routes import chat, embeddings, imagegen, models, separation, stt, systemone, tts
 
 logger = get_logger("backend")
 
@@ -131,6 +131,7 @@ async def upstream_exception_handler(request: Request, exc: httpx.HTTPError) -> 
 
 app.include_router(chat.router)
 app.include_router(embeddings.router)
+app.include_router(systemone.router)
 app.include_router(models.router)
 app.include_router(tts.router)
 app.include_router(stt.router)

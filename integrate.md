@@ -24,6 +24,7 @@ client = OpenAI(base_url="http://HOST:8000/v1", api_key="<API_KEY>")
 | GET | `/v1/models` | List available models |
 | POST | `/v1/chat/completions` | Chat (streaming, tools, vision) |
 | POST | `/v1/embeddings` | Text embeddings |
+| POST | `/v1/systemone` | Typed decisions with Jev-style decision models (Ollama ≥ 0.35) |
 | POST | `/v1/audio/speech` | Text-to-speech |
 | POST | `/v1/audio/transcriptions` | Speech-to-text (multipart upload) |
 | WS | `/v1/audio/transcriptions/stream` | Streaming speech-to-text |
@@ -126,6 +127,52 @@ list shape; vector dimension depends on the model (768 for
 
 Embeddings always run on the local Ollama regardless of the server's LLM
 provider setting.
+
+---
+
+### POST /v1/systemone
+
+Jev-style **decision models** (Ollama >= 0.35): send a `state` and named, typed
+`questions`, get every answer back in one call with calibrated probabilities —
+for triage, routing, moderation and similar fast typed decisions. Models:
+`nimble` (9B), `tev1` (4B), `tev1:0.8b` (0.8B); the server must have pulled the
+one you name (`OLLAMA_PULL_MODELS`), otherwise `404`.
+
+```json
+{"model": "nimble",
+ "state": {"ticket": "I was charged twice. Please refund the extra payment."},
+ "questions": {
+   "team":    {"type": "choice", "instructions": "Which team should handle this ticket?",
+               "criteria": {"billing": "Payments and refunds", "technical": "Bugs and integrations", "other": "None of the above"}},
+   "refund":  {"type": "noul",   "instructions": "Does the customer explicitly ask for a refund?"},
+   "urgency": {"type": "score",  "instructions": "How urgent is this ticket?", "criteria": ["Routine", "Soon", "Urgent"]}}}
+```
+
+| Question `type` | Extra fields | Answer fields |
+|---|---|---|
+| `choice` | `criteria`: `{"option": "description"}` | `choice` (picked option), `probabilities` per option, `confidence` |
+| `noul` | — | `noul`: probability that the answer is yes (0–1) |
+| `score` | `criteria`: ordered labels, low → high | `score` (expected position on the 0…n-1 scale), `legend`, `probabilities`, `confidence` |
+
+```json
+{"model": "nimble",
+ "answers": {
+   "team":    {"type": "choice", "choice": "billing", "probabilities": {"billing": 0.985, "technical": 0.012, "other": 0.003}, "confidence": 0.922},
+   "refund":  {"type": "noul", "noul": 0.997},
+   "urgency": {"type": "score", "score": 0.815, "legend": {"0": "Routine", "1": "Soon", "2": "Urgent"},
+               "probabilities": {"0": 0.378, "1": 0.429, "2": 0.193}, "confidence": 0.046}},
+ "usage": {"input_tokens": 841, "output_tokens": 4}}
+```
+
+The answers are passed through from Ollama unchanged. The [TypeSafe
+SDK](https://pypi.org/project/typesafe-sdk/) works against the gateway:
+`TYPESAFE_BASE_URL=http://HOST:8000`, `TYPESAFE_API_KEY=<API_KEY>`,
+`TYPESAFE_DEFAULT_MODEL=nimble`, then `client.system_one(state=..., questions=...)`.
+(`client.models.list()` doesn't work: it expects TypeSafe's own model-list
+format, while `/v1/models` is the OpenAI one — use `/v1/models` directly.)
+
+Like embeddings, decision models always run on the local Ollama, and they
+share its VRAM: `/v1/models/loaded` and `/v1/models/unload` cover them.
 
 ---
 
