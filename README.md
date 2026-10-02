@@ -12,7 +12,7 @@ Self-hosted model-serving stack for any OpenAI-compatible client. Runs an authen
 | **imagegen** | Text-to-image and reference-image generation (Krea 2 Turbo, GPU) | internal |
 | **demucs** | Music source separation (vocals/stems, Demucs, GPU; off by default) | internal |
 
-All traffic goes through **api**, which requires `Authorization: Bearer ${API_KEY}` and exposes `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, `/v1/audio/transcriptions` (plus a `/v1/audio/transcriptions/stream` WebSocket), `/v1/audio/speech`, `/v1/images/generations`, `/v1/images/edits` (generation from 1–2 reference images: style reference, plus edits when an edit LoRA is configured), and `/v1/audio/separations` (stem separation, when enabled), plus `/health`. To share limited VRAM, `/v1/models/loaded` + `/v1/models/unload` (LLM/embeddings) and `/v1/images/models/load|unload` (image model) free one side for the other. The model services themselves are not published; add port mappings in `docker-compose.yml` if you need direct access.
+All traffic goes through **api**, which requires `Authorization: Bearer ${API_KEY}` and exposes `/v1/chat/completions`, `/v1/embeddings`, `/v1/systemone` (Jev-style decision models), `/v1/models`, `/v1/audio/transcriptions` (plus a `/v1/audio/transcriptions/stream` WebSocket), `/v1/audio/speech`, `/v1/images/generations`, `/v1/images/edits` (generation from 1–2 reference images: style reference, plus edits when an edit LoRA is configured), and `/v1/audio/separations` (stem separation, when enabled), plus `/health`. To share limited VRAM, `/v1/models/loaded` + `/v1/models/unload` (LLM/embeddings) and `/v1/images/models/load|unload` (image model) free one side for the other. The model services themselves are not published; add port mappings in `docker-compose.yml` if you need direct access.
 
 ## OpenAI compatibility
 
@@ -56,7 +56,7 @@ Once the models are downloaded, the stack starts fully offline: every service lo
 | `LLM_PROVIDER` | `local` | `local` (bundled Ollama) or `remote` (OpenAI-compatible `LLM_URL` + `LLM_API_TOKEN`) |
 | `LLM_THINKING` / `LLM_NUM_CTX` | `false` / `65536` | Default request behavior for local models |
 | `BACKEND_UPSTREAM_TIMEOUT_SECONDS` | `900` | Gateway → upstream timeout budget |
-| `OLLAMA_PULL_MODELS` | `"gemma4:12b snowflake-arctic-embed:137m"` | Space-separated models pulled by `ollama-init` (keep the quotes — the file is `source`d by `infra.sh`) |
+| `OLLAMA_PULL_MODELS` | `"gemma4:12b snowflake-arctic-embed:137m tev1 nimble"` | Space-separated models pulled by `ollama-init` (keep the quotes — the file is `source`d by `infra.sh`). `tev1` and `nimble` are the decision models for `/v1/systemone` |
 | `ENABLE_STT` / `ENABLE_TTS` / `ENABLE_IMAGEGEN` | `true` | Toggle the optional services (compose profiles) |
 | `WHISPER_MODEL` | `large-v3-turbo` | Whisper model size |
 | `TTS_MODEL` | `KittenML/kitten-tts-nano-0.8` | KittenTTS model |
