@@ -528,9 +528,21 @@ async def _generate_response(
 
     data = []
     for i in range(body.n):
-        image = await asyncio.to_thread(
-            _generate, app, body.prompt, body.negative_prompt, width, height, references, style
-        )
+        try:
+            image = await asyncio.to_thread(
+                _generate, app, body.prompt, body.negative_prompt, width, height, references, style
+            )
+        except torch.cuda.OutOfMemoryError:
+            logger.exception("GPU out of memory generating a %dx%d image", width, height)
+            return _error(
+                503,
+                f"GPU out of memory generating a {width}x{height} image. Free VRAM (POST /v1/models/unload "
+                "unloads the LLMs) or request a smaller size.",
+                "api_error",
+            )
+        except Exception as exc:
+            logger.exception("Image generation failed")
+            return _error(500, f"image generation failed: {type(exc).__name__}: {exc}", "api_error")
         data.append({"b64_json": _image_to_b64(image)})
         logger.info("Image %d/%d generated", i + 1, body.n)
 

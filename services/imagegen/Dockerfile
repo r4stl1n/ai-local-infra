@@ -1,7 +1,9 @@
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 
+# gcc + Python headers: Triton compiles a small C launcher the first time torch
+# JIT-compiles a GPU kernel, and fails ("Failed to find C compiler") without them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.12 python3-pip python3.12-venv && \
+      python3.12 python3-pip python3.12-venv python3.12-dev gcc libc6-dev && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
