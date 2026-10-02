@@ -5,7 +5,7 @@ Self-hosted model-serving stack for any OpenAI-compatible client. Runs an authen
 | Service | Purpose | Port |
 |---|---|---|
 | **api** | OpenAI-compatible gateway (`/v1/*`) with Bearer auth; the stack's only published port | 8000 |
-| **ollama** | LLM inference + embeddings | internal |
+| **ollama** | LLM inference, embeddings, and Jev-style decision models (`tev1`, `nimble`) | internal |
 | **ollama-init** | One-shot model pull on first start (skips models already present, so startup works offline) | - |
 | **whisper** | Speech-to-text (faster-whisper, GPU) | internal |
 | **kittentts** | Text-to-speech (KittenTTS, CPU) | internal |
@@ -24,7 +24,31 @@ The gateway aims to be a drop-in `base_url` for OpenAI SDKs:
 - **Thinking models**: the non-standard `think: true|false` request field (default: `LLM_THINKING`) toggles reasoning; when off, `<think>` blocks are stripped from responses, streaming included. In remote mode, passing `think` explicitly also injects the vLLM `chat_template_kwargs.enable_thinking` toggle; otherwise the outgoing body stays strictly OpenAI-spec.
 - **Not supported**: `n > 1` and `logprobs`; streaming responses always include `usage` in the final chunk.
 
-With `LLM_PROVIDER=remote`, chat and `/v1/models` proxy to `LLM_URL`, which may be a bare host, a `.../v1` base, or a full `.../v1/chat/completions` URL — the gateway normalizes the path either way. Embeddings always use the bundled Ollama.
+With `LLM_PROVIDER=remote`, chat and `/v1/models` proxy to `LLM_URL`, which may be a bare host, a `.../v1` base, or a full `.../v1/chat/completions` URL — the gateway normalizes the path either way. Embeddings and decision models always use the bundled Ollama.
+
+## Decision models (Jev)
+
+`POST /v1/systemone` serves Ollama's [Jev-style decision models](https://ollama.com/blog/ollama-now-supports-jev-style-decision-models): send a `state` plus named, typed questions and get every answer back in one call with calibrated probabilities — fast typed decisions for ticket triage, model routing, moderation and the like. Question types are `choice` (pick one of named options), `noul` (yes/no probability) and `score` (position on an ordered scale).
+
+```bash
+curl http://HOST:8000/v1/systemone -H "Authorization: Bearer $API_KEY" -d '{
+  "model": "tev1",
+  "state": {"ticket": "I was charged twice. Please refund the extra payment."},
+  "questions": {
+    "team":    {"type": "choice", "instructions": "Which team should handle this ticket?",
+                "criteria": {"billing": "Payments and refunds", "technical": "Bugs and integrations"}},
+    "refund":  {"type": "noul", "instructions": "Does the customer ask for a refund?"},
+    "urgency": {"type": "score", "instructions": "How urgent is this ticket?", "criteria": ["Routine", "Soon", "Urgent"]}
+  }}'
+# -> {"answers": {"team": {"choice": "billing", "probabilities": {...}}, "refund": {"noul": 0.99}, "urgency": {"score": 0.8, ...}}, ...}
+```
+
+- **Models**: `tev1` (4B) and `nimble` (9B, the most accurate) are pulled by default via `OLLAMA_PULL_MODELS`; `tev1:0.8b` is a tiny option.
+- **Needs Ollama ≥ 0.35.** Compose uses `ollama/ollama:latest`, but an already-pulled image doesn't update itself: `docker compose pull ollama && ./infra.sh start`.
+- **TypeSafe SDK**: point it at the gateway with `TYPESAFE_BASE_URL=http://HOST:8000`, `TYPESAFE_API_KEY=$API_KEY` and `TYPESAFE_DEFAULT_MODEL=tev1`, then call `client.system_one(state=..., questions=...)`. (`client.models.list()` expects TypeSafe's own list format and fails against Ollama's OpenAI-style `/v1/models`.)
+- Decision models share Ollama's VRAM: `/v1/models/loaded` and `/v1/models/unload` cover them.
+
+Full field and response reference: [integrate.md](integrate.md#post-v1systemone).
 
 ## Prerequisites
 
