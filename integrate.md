@@ -258,18 +258,28 @@ If no model is loaded (after `unload`), generation returns `503`.
 
 ### POST /v1/images/edits
 
-Generates an image from a prompt **plus 1–2 reference images**: the model sees
-the references as context, so this covers editing ("make the sky purple"),
-subject reference ("this dog wearing a space suit"), combining two images, and
-— with `reference_mode: "style"` — rendering a new prompt in a reference's style.
-It's the OpenAI `images/edits` endpoint, so `client.images.edit(...)` works.
+Generates an image from a prompt **plus 1–2 reference images**. It's the
+OpenAI `images/edits` endpoint, so `client.images.edit(...)` works.
+
+Krea 2 is a text-to-image model: it only uses reference images through a LoRA
+trained for it, one per `reference_mode`:
+
+- **`style`** (default, always available): renders the prompt in the
+  references' style — palette, medium, brushwork, lighting — without copying
+  their content. "a yeti reading a book" + an oil painting → an oil-painted yeti.
+- **`edit`**: the references as subject/edit context ("the same dog in a space
+  suit", "make the sky purple"). Only available when the server has an edit
+  LoRA configured (`IMAGEGEN_EDIT_LORA`); otherwise `400`. No general-purpose
+  Krea 2 edit LoRA is published yet.
+
+`GET /v1/images/models` lists the available modes in `reference_modes`.
 
 Multipart (OpenAI SDK / curl):
 
 ```bash
 curl http://HOST:8000/v1/images/edits -H "Authorization: Bearer $API_KEY" \
-  -F prompt="the same cat, wearing a tiny wizard hat" \
-  -F "image[]=@cat.png" -F size=auto
+  -F prompt="a cat sleeping on a windowsill" \
+  -F "image[]=@watercolor.png" -F size=auto
 ```
 
 JSON (references as `data:` URIs or bare base64):
@@ -282,7 +292,7 @@ JSON (references as `data:` URIs or bare base64):
 |---|---|---|
 | `image` / `image[]` (multipart) or `images` (JSON) | required | 1–2 reference images (PNG/JPEG/WebP, ≤ 20 MB each). JSON entries may be a string or `{"image_url": ...}` / `{"b64_json": ...}`; remote `http(s)` URLs are not fetched (400) |
 | `prompt` | required | Describe the result or the change you want |
-| `reference_mode` | `"edit"` | Extension. `edit`: references as subject/edit context. `style`: generate the prompt in the references' style (style-reference LoRA) |
+| `reference_mode` | `"style"` | Extension. `style` or `edit` (see above); a mode whose LoRA isn't loaded is a `400` |
 | `size` | `"auto"` | `auto` matches the first reference's aspect ratio at ~1 MP; otherwise as in `/generations` |
 | `n`, `negative_prompt`, `model`, `response_format` | | As in `/generations` |
 | `mask` | — | Not supported (400): Krea 2 conditions on whole images and does not inpaint |
@@ -299,7 +309,7 @@ frees its VRAM. Loads are slow (weights + VRAM) and the request blocks until
 the new model is ready.
 
 ```
-GET  /v1/images/models              -> {"current": "krea2-turbo", "data": [{"id": "krea2-turbo", "loaded": bool, "downloaded": bool}, ...]}
+GET  /v1/images/models              -> {"current": "krea2-turbo", "reference_modes": ["style"], "data": [{"id": "krea2-turbo", "loaded": bool, "downloaded": bool}, ...]}
 POST /v1/images/models/load  {"model": "krea2-raw"} -> {"current": "krea2-raw"}
 POST /v1/images/models/unload                      -> {"current": null}
 ```

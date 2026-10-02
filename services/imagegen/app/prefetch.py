@@ -16,7 +16,7 @@ from app.config import (
     VAE,
     VARIANTS,
     pipeline_source,
-    style_lora_source,
+    reference_lora_sources,
     transformer_source,
 )
 
@@ -30,11 +30,9 @@ def main() -> int:
         ("text encoder + processor", QWEN_VL),
         ("VAE", VAE),
         ("pipeline", pipeline_source()),
-        ("style LoRA", style_lora_source()),
+        *((f"{mode} LoRA", source) for mode, source in reference_lora_sources().items()),
     ]
     for label, source in sources:
-        if source is None:
-            continue
         print(f"Pulling {label}: {source.repo} {list(source.patterns)}", flush=True)
         snapshot_download(source.repo, allow_patterns=list(source.patterns))
     return 0

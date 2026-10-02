@@ -154,6 +154,7 @@ services:
       - IMAGEGEN_STEPS=${IMAGEGEN_STEPS:-}
       - IMAGEGEN_GUIDANCE=${IMAGEGEN_GUIDANCE:-}
       - IMAGEGEN_STYLE_LORA=${IMAGEGEN_STYLE_LORA-ostris/krea2_turbo_style_reference:krea2_style_reference.safetensors}
+      - IMAGEGEN_EDIT_LORA=${IMAGEGEN_EDIT_LORA:-}
       # ComfyUI's pre-scaled fp8 transformer so Krea 2 fits a 24 GB GPU (0 = bf16, needs ~32 GB+).
       - IMAGEGEN_FP8=${IMAGEGEN_FP8:-1}
       # Never reach the network for weights: cached models load, missing ones error

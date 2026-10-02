@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end check of Krea 2 image generation against the running stack.
 #
-#   tests/e2e/test_imagegen.sh            # generation, references, style, errors
+#   tests/e2e/test_imagegen.sh            # generation, style references, errors
 #   tests/e2e/test_imagegen.sh --vram     # also exercise the VRAM unload/load endpoints
 #
 # Configuration via environment (falls back to the repo .env for API_KEY):
@@ -104,7 +104,7 @@ status=$(api GET /health "${TMP}/health")
 [[ "${status}" == "200" ]] && ok "gateway /health" || { bad "gateway /health: HTTP ${status}"; exit 1; }
 status=$(api GET /v1/images/models "${TMP}/models")
 if [[ "${status}" == "200" ]]; then
-  ok "image models: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("current=%s " % d["current"] + ", ".join("%s(downloaded=%s)" % (m["id"], m.get("downloaded")) for m in d["data"]))' "${TMP}/models")"
+  ok "image models: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("current=%s " % d["current"] + ", ".join("%s(downloaded=%s)" % (m["id"], m.get("downloaded")) for m in d["data"]) + " | reference_modes=%s" % d.get("reference_modes"))' "${TMP}/models")"
 else
   bad "GET /v1/images/models: HTTP ${status}: $(error_message "${TMP}/models")"
 fi
@@ -126,20 +126,23 @@ WIDE="${OUT_DIR}/02_wide_0.png"
 if [[ ! -f "${REF}" || ! -f "${WIDE}" ]]; then
   red "Text-to-image failed; skipping the reference-image tests (they reuse those images)."
 else
+  REF_MODES=$(python3 -c 'import json,sys; print(" ".join(json.load(open(sys.argv[1])).get("reference_modes", [])))' "${TMP}/models" 2>/dev/null)
+
   echo
-  echo "== Reference images (/v1/images/edits)"
+  echo "== Style references (/v1/images/edits, reference_mode=style)"
+  echo "  Outputs should take the reference's look (here: the lighthouse oil painting), not its content."
   SECONDS=0
-  status=$(api POST /v1/images/edits "${TMP}/edit" \
-    -F 'prompt=the same fox, now at night under the northern lights' -F "image[]=@${REF};type=image/png" -F size=1024x1024)
-  expect_image "edit mode, multipart, 1 reference" "${status}" "${TMP}/edit" "${OUT_DIR}/03_edit" 1024x1024
+  status=$(api POST /v1/images/edits "${TMP}/style1" \
+    -F 'prompt=a cat sleeping on a sunny windowsill' -F "image[]=@${WIDE};type=image/png" -F size=1024x1024)
+  expect_image "default mode (style), multipart: painted cat" "${status}" "${TMP}/style1" "${OUT_DIR}/03_style_cat" 1024x1024
 
   SECONDS=0
   status=$(api POST /v1/images/edits "${TMP}/auto" \
-    -F 'prompt=the same lighthouse in bright summer sunshine' -F "image=@${WIDE};type=image/png" -F size=auto)
-  expect_image "size=auto follows the landscape reference" "${status}" "${TMP}/auto" "${OUT_DIR}/04_auto" 1248x832
+    -F 'prompt=a busy harbor town at dusk' -F "image=@${WIDE};type=image/png" -F size=auto)
+  expect_image "size=auto follows the landscape reference: painted harbor" "${status}" "${TMP}/auto" "${OUT_DIR}/04_style_auto" 1248x832
 
-  # JSON body with data: URIs, two references, style mode (style-reference LoRA).
-  python3 - "${WIDE}" "${REF}" >"${TMP}/style_req.json" <<'EOF'
+  # JSON body with a data: URI and an explicit reference_mode.
+  python3 - "${WIDE}" >"${TMP}/style_req.json" <<'PY'
 import base64, json, sys
 uri = lambda p: "data:image/png;base64," + base64.b64encode(open(p, "rb").read()).decode()
 print(json.dumps({
@@ -148,16 +151,28 @@ print(json.dumps({
     "reference_mode": "style",
     "size": "1024x1024",
 }))
-EOF
+PY
   SECONDS=0
   status=$(api POST /v1/images/edits "${TMP}/style" -H 'Content-Type: application/json' -d @"${TMP}/style_req.json")
-  expect_image "style mode, JSON data URI (yeti in the lighthouse painting's style)" "${status}" "${TMP}/style" "${OUT_DIR}/05_style" 1024x1024
+  expect_image "style, JSON data URI: painted yeti" "${status}" "${TMP}/style" "${OUT_DIR}/05_style_yeti" 1024x1024
 
   SECONDS=0
   status=$(api POST /v1/images/edits "${TMP}/two" \
-    -F 'prompt=the fox standing in front of the lighthouse' \
-    -F "image[]=@${REF};type=image/png" -F "image[]=@${WIDE};type=image/png" -F size=1024x1024)
-  expect_image "edit mode, 2 references" "${status}" "${TMP}/two" "${OUT_DIR}/06_two_refs" 1024x1024
+    -F 'prompt=a mountain cabin in a snowy forest' \
+    -F "image[]=@${WIDE};type=image/png" -F "image[]=@${REF};type=image/png" -F size=1024x1024)
+  expect_image "style, 2 references (painting + photo)" "${status}" "${TMP}/two" "${OUT_DIR}/06_style_two_refs" 1024x1024
+
+  echo
+  echo "== Edit mode (reference_mode=edit, needs IMAGEGEN_EDIT_LORA)"
+  if [[ " ${REF_MODES} " == *" edit "* ]]; then
+    SECONDS=0
+    status=$(api POST /v1/images/edits "${TMP}/edit" -F reference_mode=edit \
+      -F 'prompt=the same fox, now at night under the northern lights' -F "image[]=@${REF};type=image/png" -F size=1024x1024)
+    expect_image "edit: the same fox at night" "${status}" "${TMP}/edit" "${OUT_DIR}/07_edit_fox" 1024x1024
+  else
+    status=$(api POST /v1/images/edits "${TMP}/edit" -F reference_mode=edit -F prompt=x -F "image=@${REF}")
+    expect_error "edit without an edit LoRA is refused" 400 "${status}" "${TMP}/edit"
+  fi
 
   echo
   echo "== Request validation (should be rejected fast)"
