@@ -335,6 +335,22 @@ def _set_adapter(pipe: DiffusionPipeline, adapter: str | None) -> None:
         pipe.transformer.disable_adapters()
 
 
+def _reset_offload(pipe: DiffusionPipeline) -> None:
+    """Put every model back on CPU and re-arm model CPU offload after a failed render.
+
+    A render that dies mid-way (typically OOM while an offload hook is moving a
+    model to the GPU) can leave that model split between GPU and CPU. accelerate's
+    offload hook only checks the first parameter's device before skipping the
+    move, so it never repairs the split, and every later render fails with
+    "Expected all tensors to be on the same device". The pipeline's own cleanup
+    (maybe_free_model_hooks) only runs on success, so run it here.
+    """
+    try:
+        pipe.maybe_free_model_hooks()
+    except Exception as exc:  # best-effort — never mask the original error
+        logger.warning("Offload reset after failed render hit %s: %s", type(exc).__name__, exc)
+
+
 def _generate(
     app: FastAPI,
     prompt: str,
@@ -354,6 +370,9 @@ def _generate(
             _set_adapter(pipe, adapter)
         try:
             return _render(pipe, prompt, negative_prompt, width, height, references)
+        except Exception:
+            _reset_offload(pipe)
+            raise
         finally:
             if adapter:
                 _set_adapter(pipe, None)
