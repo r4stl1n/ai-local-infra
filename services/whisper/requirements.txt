@@ -2,5 +2,7 @@ fastapi
 uvicorn
 websockets
 faster-whisper
+# faster-whisper passes metadata_errors= to av.open(), which PyAV 19 removed
+av<19
 python-multipart
 numpy
